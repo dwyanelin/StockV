@@ -1,6 +1,8 @@
 """Unit tests for Chinese stock name command parsing and Taiwan stock directory lookup."""
 from __future__ import annotations
 
+import datetime
+import math
 import sys
 import types
 import unittest
@@ -129,7 +131,13 @@ class CommandParsingAndHandlingTests(unittest.TestCase):
             },
         )
         make_mod("linebot.v3.webhooks", {"MessageEvent": object, "TextMessageContent": object})
-        make_mod("pandas", {"DataFrame": object})
+        make_mod(
+            "pandas",
+            {
+                "DataFrame": object,
+                "isna": lambda v: v is None or (isinstance(v, float) and math.isnan(v)),
+            },
+        )
         make_mod("yfinance", {"Ticker": mock.MagicMock})
         make_mod("matplotlib", {"use": lambda *a, **kw: None})
         make_mod("matplotlib.dates", {})
@@ -212,6 +220,180 @@ class CommandParsingAndHandlingTests(unittest.TestCase):
             fetch_mock.assert_called_once_with("3406")
             self.assertEqual(len(msgs), 2)
             self.assertIn("玉晶光 (3406)", msgs[1].text)
+
+
+class _FakeSeries:
+    def __init__(self, values: list):
+        self._values = values
+
+    @property
+    def iloc(self):
+        return self._values
+
+
+class _FakeLoc:
+    def __init__(self, df: "_FakeDF"):
+        self._df = df
+
+    def __getitem__(self, key):
+        idx, col = key
+        pos = self._df.index.index(idx)
+        return self._df._data[col][pos]
+
+    def __setitem__(self, key, val):
+        idx, col = key
+        pos = self._df.index.index(idx)
+        self._df._data[col][pos] = val
+
+
+class _FakeDF:
+    """Minimal pandas.DataFrame stand-in for testing daily_history without pandas."""
+
+    def __init__(self, index: list[datetime.datetime], data: dict[str, list]):
+        self.index = list(index)
+        self._data = {k: list(v) for k, v in data.items()}
+        self.columns = list(data.keys())
+
+    @property
+    def empty(self) -> bool:
+        return len(self.index) == 0
+
+    @property
+    def loc(self) -> _FakeLoc:
+        return _FakeLoc(self)
+
+    def __getitem__(self, col: str) -> _FakeSeries:
+        return _FakeSeries(self._data[col])
+
+    def copy(self) -> "_FakeDF":
+        return _FakeDF(self.index, self._data)
+
+    def dropna(self, subset: list[str]) -> "_FakeDF":
+        keep = [
+            i for i in range(len(self.index))
+            if all(
+                self._data[c][i] is not None
+                and not (isinstance(self._data[c][i], float) and math.isnan(self._data[c][i]))
+                for c in subset
+            )
+        ]
+        return _FakeDF(
+            [self.index[i] for i in keep],
+            {c: [vals[i] for i in keep] for c, vals in self._data.items()},
+        )
+
+
+class DailyHistoryBackfillTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Ensure app.stock.data can be imported even without pandas/yfinance installed.
+        cls._injected: list[str] = []
+        if "pandas" not in sys.modules:
+            try:
+                import pandas  # noqa: F401
+            except ModuleNotFoundError:
+                m = types.ModuleType("pandas")
+                m.DataFrame = object
+                m.isna = lambda v: v is None or (isinstance(v, float) and math.isnan(v))
+                sys.modules["pandas"] = m
+                cls._injected.append("pandas")
+        if "yfinance" not in sys.modules:
+            try:
+                import yfinance  # noqa: F401
+            except ModuleNotFoundError:
+                m = types.ModuleType("yfinance")
+                m.Ticker = mock.MagicMock
+                sys.modules["yfinance"] = m
+                cls._injected.append("yfinance")
+        from app.stock import data as data_mod
+        cls.data = data_mod
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for name in cls._injected:
+            sys.modules.pop(name, None)
+
+    def test_backfills_nan_close_from_1d_bar(self) -> None:
+        quote = self.data.StockQuote("7822", "7822.TW", "倍利科", True, "TWD")
+        d1 = datetime.datetime(2026, 11, 20, 9, 0)
+        d2 = datetime.datetime(2026, 11, 23, 9, 0)
+        df_6mo = _FakeDF(
+            [d1, d2],
+            {
+                "Open": [480.0, 469.5],
+                "High": [494.0, 495.0],
+                "Low": [472.5, 447.0],
+                "Close": [472.5, float("nan")],
+                "Volume": [227040, 277786],
+            },
+        )
+        df_1d = _FakeDF(
+            [datetime.datetime(2026, 11, 23, 13, 30)],
+            {
+                "Open": [469.5],
+                "High": [495.0],
+                "Low": [447.0],
+                "Close": [493.0],
+                "Volume": [277786],
+            },
+        )
+        fake_tk = mock.MagicMock()
+        fake_tk.history.side_effect = [df_6mo, df_1d]
+
+        with mock.patch.object(self.data.yf, "Ticker", return_value=fake_tk):
+            out = self.data.daily_history(quote, months=6)
+
+        self.assertEqual(len(out.index), 2)
+        self.assertEqual(out["Close"].iloc[-1], 493.0)
+
+    def test_backfills_nan_close_from_fast_info_when_1d_empty(self) -> None:
+        quote = self.data.StockQuote("7822", "7822.TW", "倍利科", True, "TWD")
+        d1 = datetime.datetime(2026, 11, 20, 9, 0)
+        d2 = datetime.datetime(2026, 11, 23, 9, 0)
+        df_6mo = _FakeDF(
+            [d1, d2],
+            {
+                "Open": [480.0, 469.5],
+                "High": [494.0, 490.0],
+                "Low": [472.5, 447.0],
+                "Close": [472.5, float("nan")],
+                "Volume": [227040, 277786],
+            },
+        )
+        fake_tk = mock.MagicMock()
+        fake_tk.history.side_effect = [df_6mo, _FakeDF([], {})]
+        fake_tk.fast_info = types.SimpleNamespace(last_price=493.0)
+
+        with mock.patch.object(self.data.yf, "Ticker", return_value=fake_tk):
+            out = self.data.daily_history(quote, months=6)
+
+        self.assertEqual(len(out.index), 2)
+        self.assertEqual(out["Close"].iloc[-1], 493.0)
+        self.assertEqual(out["High"].iloc[-1], 493.0)
+
+    def test_drops_unrecoverable_nan_row(self) -> None:
+        quote = self.data.StockQuote("7822", "7822.TW", "倍利科", True, "TWD")
+        d1 = datetime.datetime(2026, 11, 20, 9, 0)
+        d2 = datetime.datetime(2026, 11, 23, 9, 0)
+        df_6mo = _FakeDF(
+            [d1, d2],
+            {
+                "Open": [480.0, 469.5],
+                "High": [494.0, 495.0],
+                "Low": [472.5, 447.0],
+                "Close": [472.5, float("nan")],
+                "Volume": [227040, 277786],
+            },
+        )
+        fake_tk = mock.MagicMock()
+        fake_tk.history.side_effect = [df_6mo, _FakeDF([], {})]
+        fake_tk.fast_info = types.SimpleNamespace(last_price=None)
+
+        with mock.patch.object(self.data.yf, "Ticker", return_value=fake_tk):
+            out = self.data.daily_history(quote, months=6)
+
+        self.assertEqual(len(out.index), 1)
+        self.assertEqual(out["Close"].iloc[-1], 472.5)
 
 
 if __name__ == "__main__":
