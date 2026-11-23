@@ -12,9 +12,9 @@ matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
 import mplfinance as mpf
 import pandas as pd
+from matplotlib.ticker import FuncFormatter
 
 from app.stock.data import DividendReport, StockQuote
 from app.stock.institutional import InstReport
@@ -322,7 +322,7 @@ def candlestick_chart(
         _style_ax(ax_vol, right_axis=True)
 
     mav_tuple = tuple(w for w in (5, 20, 60) if len(df) >= w)
-    mav_colors = [c for w, c in zip((5, 20, 60), (YELLOW, BLUE, PURPLE)) if len(df) >= w]
+    mav_colors = [c for w, c in zip((5, 20, 60), (YELLOW, BLUE, PURPLE), strict=False) if len(df) >= w]
     plot_kwargs = dict(
         type="candle",
         ax=ax_price,
@@ -497,7 +497,7 @@ def dividend_chart(report: DividendReport, path: str) -> str:
 
     bar_colors = [BLUE if i < len(vals) - 1 else "#f59e0b" for i in range(len(vals))]
     ax.bar(xs, vals, width=0.52, color=bar_colors, alpha=0.92, zorder=3)
-    for xi, v in zip(xs, vals):
+    for xi, v in zip(xs, vals, strict=False):
         ax.annotate(
             f"{v:.2f}",
             xy=(xi, v), xytext=(0, 5), textcoords="offset points",

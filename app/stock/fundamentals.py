@@ -228,8 +228,8 @@ def fetch(quote: StockQuote) -> FundamentalReport:
     # US stock fundamentals via yfinance .info
     try:
         info = yf.Ticker(quote.yahoo_symbol).info or {}
-    except Exception:
-        raise FundamentalDataUnavailable(quote.ticker)
+    except Exception as err:
+        raise FundamentalDataUnavailable(quote.ticker) from err
 
     val = Valuation(
         pe=_fnum(info.get("trailingPE")),

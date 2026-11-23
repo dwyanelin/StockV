@@ -281,8 +281,8 @@ async def webhook(request: Request):
     try:
         from starlette.concurrency import run_in_threadpool
         await run_in_threadpool(handler.handle, body, signature)
-    except InvalidSignatureError:
-        raise HTTPException(400, "invalid signature")
+    except InvalidSignatureError as err:
+        raise HTTPException(400, "invalid signature") from err
     return PlainTextResponse("OK")
 
 

@@ -1,0 +1,51 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+filterwarnings = [
+    # Third-party matplotlib / pyparsing deprecation noise in Python 3.12+
+    "ignore::pyparsing.warnings.PyparsingDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+# 方案 A（務實高價值測試）：
+# 核心邏輯模組（指令解析、API/資料整合、Flex 卡片、台股目錄與別名）納入嚴格覆蓋率門檻；
+# app/stock/charts.py 為 matplotlib/mplfinance 繪圖層，改以 smoke test 驗證能正確輸出有效 PNG，
+# 不為追行數覆蓋率而寫脆弱的像素/軸線 mock（若有純邏輯應抽離出來測）。
+omit = [
+    "app/__init__.py",
+    "app/stock/__init__.py",
+    "app/stock/charts.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 2
+fail_under = 90
+exclude_also = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    # Allow long lines in Chinese copy / URLs / Flex JSON layouts
+    "E501",
+]
