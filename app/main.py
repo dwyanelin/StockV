@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -20,14 +21,14 @@ from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     ApiClient,
     Configuration,
-    ImageMessage,
     MessagingApi,
     ReplyMessageRequest,
+    ShowLoadingAnimationRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, PostbackEvent, TextMessageContent
 
-from app import config
+from app import config, flex
 from app.stock import charts, data, institutional, tw_directory
 
 logging.basicConfig(level=logging.INFO)
@@ -46,18 +47,7 @@ _COMMAND = re.compile(
 )
 _HELP_WORDS = {"help", "幫助", "指令", "說明", "使用說明"}
 
-HELP_TEXT = (
-    "📈 StockV 指令說明\n"
-    "──────────────\n"
-    "P+代號/股名｜當日走勢圖\n"
-    "　例：P2330、P玉晶光、PAAPL\n"
-    "K+代號/股名｜日K線圖（近6個月）\n"
-    "　例：K2330、K玉晶光、KTSLA\n"
-    "T+代號/股名｜三大法人買賣超（台股上市）\n"
-    "　例：T2330、T台積電\n"
-    "──────────────\n"
-    "台股支援代號或中文簡稱，美股輸入英文代號"
-)
+_base_url_from_request: str = ""
 
 
 def _parse_command(text: str) -> tuple[str, str] | None:
@@ -68,7 +58,15 @@ def _parse_command(text: str) -> tuple[str, str] | None:
     target = m.group(2) or m.group(3) or m.group(4)
     return m.group(1).upper(), target
 
-_base_url_from_request: str = ""
+
+def _parse_postback(raw_data: str) -> tuple[str, str] | None:
+    """Parse postback query string like 'cmd=K&q=7822' into (kind, query)."""
+    qs = parse_qs(raw_data or "")
+    cmd = (qs.get("cmd") or [""])[0].strip().upper()
+    query = (qs.get("q") or [""])[0].strip()
+    if cmd in ("P", "K", "T") and query:
+        return cmd, query
+    return None
 
 
 def _base_url() -> str:
@@ -92,13 +90,32 @@ def _cleanup_charts() -> None:
         pass
 
 
-def _fmt_lots(shares: float) -> str:
-    lots = shares / 1000
-    return f"{lots:+,.0f}"
+def _start_loading(event) -> None:
+    """Show LINE's native typing/loading animation in 1-on-1 chats."""
+    source = getattr(event, "source", None)
+    if getattr(source, "type", None) != "user":
+        return
+    user_id = getattr(source, "user_id", None)
+    if not user_id:
+        return
+    try:
+        with ApiClient(line_config) as client:
+            MessagingApi(client).show_loading_animation(
+                ShowLoadingAnimationRequest(chat_id=user_id, loading_seconds=15)
+            )
+    except Exception:
+        log.debug("show_loading_animation failed", exc_info=True)
+
+
+def _reply(reply_token: str, messages: list) -> None:
+    with ApiClient(line_config) as client:
+        MessagingApi(client).reply_message(
+            ReplyMessageRequest(reply_token=reply_token, messages=messages)
+        )
 
 
 def _handle_command(kind: str, query: str) -> list:
-    """Build LINE reply messages for one command. Raises on data errors."""
+    """Build LINE Flex reply messages for one command. Raises on data errors."""
     kind = kind.upper()
     query = query.strip()
 
@@ -115,64 +132,64 @@ def _handle_command(kind: str, query: str) -> list:
         report = institutional.fetch(ticker)
         path, url = _new_chart_path()
         charts.institutional_chart(report, path)
-        latest = report.days[-1]
-        lines = [
-            f"🏦 {report.name} ({ticker}) 三大法人",
-            f"📅 {latest.day:%Y-%m-%d} 買賣超（張）",
-            f"　外資：{_fmt_lots(latest.foreign)}",
-            f"　投信：{_fmt_lots(latest.trust)}",
-            f"　自營商：{_fmt_lots(latest.dealer)}",
-            f"　合計：{_fmt_lots(latest.total)}",
-        ]
-        if report.foreign_holding_pct is not None:
-            lines.append(f"🌍 外資持股比率：{report.foreign_holding_pct:.2f}%")
-        return [
-            ImageMessage(original_content_url=url, preview_image_url=url),
-            TextMessage(text="\n".join(lines)),
-        ]
+        return [flex.institutional_card(report, url)]
 
     quote = data.resolve(query)
     path, url = _new_chart_path()
     if kind == "P":
         df, prev_close = data.intraday(quote)
         charts.intraday_chart(quote, df, prev_close, path)
-    else:  # K
-        df = data.daily_history(quote, months=6)
-        charts.candlestick_chart(quote, df, path)
-    return [ImageMessage(original_content_url=url, preview_image_url=url)]
+        return [flex.intraday_card(quote, df, prev_close, url)]
+
+    df = data.daily_history(quote, months=6)
+    charts.candlestick_chart(quote, df, path)
+    return [flex.candlestick_card(quote, df, url)]
+
+
+def _execute_and_reply(event, kind: str, query: str, is_group: bool) -> None:
+    _start_loading(event)
+    try:
+        _cleanup_charts()
+        messages = _handle_command(kind, query)
+    except data.StockNotFoundError:
+        if is_group and _HAS_CJK.search(query):
+            return  # avoid false positives on casual Chinese chat in groups
+        messages = [TextMessage(
+            text=f"❓ 找不到「{query}」的股價資料，請確認代號或名稱是否正確。")]
+    except institutional.InstitutionalDataUnavailable:
+        messages = [TextMessage(
+            text=f"❓ 查不到「{query}」的法人資料（目前僅支援台股上市股票）。")]
+    except Exception:
+        log.exception("command failed: %s %s", kind, query)
+        messages = [TextMessage(text="⚠️ 系統忙碌中，請稍後再試一次。")]
+
+    _reply(event.reply_token, messages)
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_message(event: MessageEvent) -> None:
     text = event.message.text.strip()
-    messages = None
     is_group = getattr(getattr(event, "source", None), "type", "user") != "user"
 
     if text.lower() in _HELP_WORDS:
-        messages = [TextMessage(text=HELP_TEXT)]
-    else:
-        parsed = _parse_command(text)
-        if not parsed:
-            return  # not for us — stay quiet in group chats
-        kind, query = parsed
-        try:
-            _cleanup_charts()
-            messages = _handle_command(kind, query)
-        except data.StockNotFoundError:
-            if is_group and _HAS_CJK.search(query):
-                return  # avoid false positives on casual Chinese chat in groups
-            messages = [TextMessage(
-                text=f"❓ 找不到「{query}」的股價資料，請確認代號或名稱是否正確。")]
-        except institutional.InstitutionalDataUnavailable:
-            messages = [TextMessage(
-                text=f"❓ 查不到「{query}」的法人資料（目前僅支援台股上市股票）。")]
-        except Exception:
-            log.exception("command failed: %s", text)
-            messages = [TextMessage(text="⚠️ 系統忙碌中，請稍後再試一次。")]
+        _reply(event.reply_token, [flex.help_card()])
+        return
 
-    with ApiClient(line_config) as client:
-        MessagingApi(client).reply_message(
-            ReplyMessageRequest(reply_token=event.reply_token, messages=messages))
+    parsed = _parse_command(text)
+    if not parsed:
+        return  # not for us — stay quiet in group chats
+    kind, query = parsed
+    _execute_and_reply(event, kind, query, is_group)
+
+
+@handler.add(PostbackEvent)
+def on_postback(event: PostbackEvent) -> None:
+    parsed = _parse_postback(getattr(getattr(event, "postback", None), "data", ""))
+    if not parsed:
+        return
+    is_group = getattr(getattr(event, "source", None), "type", "user") != "user"
+    kind, query = parsed
+    _execute_and_reply(event, kind, query, is_group)
 
 
 @app.post("/webhook")
