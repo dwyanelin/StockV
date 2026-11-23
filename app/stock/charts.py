@@ -16,7 +16,7 @@ from matplotlib.ticker import FuncFormatter
 import mplfinance as mpf
 import pandas as pd
 
-from app.stock.data import StockQuote
+from app.stock.data import DividendReport, StockQuote
 from app.stock.institutional import InstReport
 
 BG = "#0f141e"
@@ -63,6 +63,14 @@ def _fmt_price(val: float, _pos=None) -> str:
         return f"{val:,.0f}"
     if abs(val) >= 100:
         return f"{val:,.1f}"
+    if abs(val) < 1 and val != 0:
+        return f"{val:.4f}"
+    return f"{val:,.2f}"
+
+
+def _price_str(val: float) -> str:
+    if abs(val) < 1 and val != 0:
+        return f"{val:.4f}"
     return f"{val:,.2f}"
 
 
@@ -115,7 +123,7 @@ def _add_price_pill(ax, price: float, color: str) -> None:
     """TradingView-style current price pill tag on the right Y-axis."""
     ax.axhline(price, color=color, linewidth=0.7, linestyle=":", alpha=0.65)
     ax.annotate(
-        f" {price:,.2f} ",
+        f" {_price_str(price)} ",
         xy=(1.0, price),
         xycoords=("axes fraction", "data"),
         xytext=(4, 0),
@@ -259,8 +267,14 @@ def intraday_chart(
     return _save(fig, path)
 
 
-def candlestick_chart(quote: StockQuote, df: pd.DataFrame, path: str) -> str:
-    """Daily candlestick chart with volume, right-axis price pill, and MA5/20/60."""
+def candlestick_chart(
+    quote: StockQuote,
+    df: pd.DataFrame,
+    path: str,
+    period_label: str = "日K 近6個月",
+    date_fmt: str = "%m/%d",
+) -> str:
+    """Candlestick chart (daily/weekly/monthly) with volume, price pill, and MA5/20/60."""
     up, down = _colors(quote.is_taiwan)
     mc = mpf.make_marketcolors(
         up=up, down=down, edge="inherit", wick="inherit",
@@ -291,65 +305,76 @@ def candlestick_chart(quote: StockQuote, df: pd.DataFrame, path: str) -> str:
     arrow = "▲" if day_chg > 0 else ("▼" if day_chg < 0 else "─")
     sign = "+" if day_chg > 0 else ""
 
-    fig, (ax_price, ax_vol) = plt.subplots(
-        2, 1, figsize=(10, 6.4), dpi=150, sharex=True,
-        gridspec_kw={"height_ratios": [3.8, 1.1], "hspace": 0.06},
-    )
+    has_vol = "Volume" in df.columns and float(df["Volume"].fillna(0).sum()) > 0
+    if has_vol:
+        fig, (ax_price, ax_vol) = plt.subplots(
+            2, 1, figsize=(10, 6.4), dpi=150, sharex=True,
+            gridspec_kw={"height_ratios": [3.8, 1.1], "hspace": 0.06},
+        )
+    else:
+        fig, ax_price = plt.subplots(figsize=(10, 6.4), dpi=150)
+        ax_vol = None
+
     fig.patch.set_facecolor(BG)
     fig.subplots_adjust(top=0.84, bottom=0.09, left=0.04, right=0.89)
     _style_ax(ax_price, right_axis=True)
-    _style_ax(ax_vol, right_axis=True)
+    if ax_vol is not None:
+        _style_ax(ax_vol, right_axis=True)
 
-    mpf.plot(
-        df,
+    mav_tuple = tuple(w for w in (5, 20, 60) if len(df) >= w)
+    mav_colors = [c for w, c in zip((5, 20, 60), (YELLOW, BLUE, PURPLE)) if len(df) >= w]
+    plot_kwargs = dict(
         type="candle",
         ax=ax_price,
-        volume=ax_vol,
+        volume=ax_vol if ax_vol is not None else False,
         style=style,
-        mav=(5, 20, 60),
-        mavcolors=[YELLOW, BLUE, PURPLE],
-        datetime_format="%m/%d",
+        datetime_format=date_fmt,
         xrotation=0,
         warn_too_much_data=1000,
     )
+    if mav_tuple:
+        plot_kwargs["mav"] = mav_tuple
+        plot_kwargs["mavcolors"] = mav_colors
+    mpf.plot(df, **plot_kwargs)
 
     ax_price.set_ylabel("")
     ax_price.yaxis.set_major_formatter(FuncFormatter(_fmt_price))
-    ax_price.tick_params(colors=MUTED, labelsize=8.5, labelbottom=False)
+    ax_price.tick_params(colors=MUTED, labelsize=8.5, labelbottom=(ax_vol is None))
 
     # Give vertical headroom for High/Low markers so they never clip
     hi_pos = int(df["High"].values.argmax())
     lo_pos = int(df["Low"].values.argmin())
     hi_val = float(df["High"].iloc[hi_pos])
     lo_val = float(df["Low"].iloc[lo_pos])
-    y_pad = max((hi_val - lo_val) * 0.10, hi_val * 0.01, 0.01)
+    y_pad = max((hi_val - lo_val) * 0.10, hi_val * 0.01, 0.0001)
     ax_price.set_ylim(lo_val - y_pad, hi_val + y_pad)
 
     _add_price_pill(ax_price, last, day_color)
 
     ax_price.annotate(
-        f"▲ {hi_val:,.1f}",
+        f"▲ {_fmt_price(hi_val)}",
         xy=(hi_pos, hi_val), xytext=(0, 6), textcoords="offset points",
         color=TEXT, fontsize=8, ha="center", va="bottom",
     )
     ax_price.annotate(
-        f"▼ {lo_val:,.1f}",
+        f"▼ {_fmt_price(lo_val)}",
         xy=(lo_pos, lo_val), xytext=(0, -10), textcoords="offset points",
         color=TEXT, fontsize=8, ha="center", va="top",
     )
 
-    ax_vol.set_ylabel("")
-    ax_vol.yaxis.set_major_formatter(_fmt_vol_axis(quote.is_taiwan))
-    ax_vol.yaxis.set_major_locator(plt.MaxNLocator(3))
-    ax_vol.tick_params(colors=MUTED, labelsize=8.5)
+    if ax_vol is not None:
+        ax_vol.set_ylabel("")
+        ax_vol.yaxis.set_major_formatter(_fmt_vol_axis(quote.is_taiwan))
+        ax_vol.yaxis.set_major_locator(plt.MaxNLocator(3))
+        ax_vol.tick_params(colors=MUTED, labelsize=8.5)
 
     # Clean two-line header above chart with live MA values (zero overlap!)
     fig.text(
-        0.04, 0.935, f"{_short(quote.name)} ({quote.ticker})  日K 近6個月",
+        0.04, 0.935, f"{_short(quote.name)} ({quote.ticker})  {period_label}",
         color=TEXT, fontsize=13.5, fontweight="bold", ha="left", va="center",
     )
     fig.text(
-        0.89, 0.935, f"{last:,.2f}  {arrow} {sign}{day_chg:,.2f} ({sign}{day_pct:.2f}%)",
+        0.89, 0.935, f"{_price_str(last)}  {arrow} {sign}{_price_str(day_chg)} ({sign}{day_pct:.2f}%)",
         color=day_color, fontsize=13, fontweight="bold", ha="right", va="center",
     )
 
@@ -361,7 +386,7 @@ def candlestick_chart(quote: StockQuote, df: pd.DataFrame, path: str) -> str:
     ]
     x_cursor = 0.04
     for label, col, val in ma_items:
-        txt = f"● {label} {val:,.1f}" if val is not None and pd.notna(val) else f"● {label} --"
+        txt = f"● {label} {_fmt_price(float(val))}" if val is not None and pd.notna(val) else f"● {label} --"
         fig.text(x_cursor, 0.88, txt, color=col, fontsize=9, fontweight="bold", ha="left", va="center")
         x_cursor += 0.145
 
@@ -374,19 +399,26 @@ def candlestick_chart(quote: StockQuote, df: pd.DataFrame, path: str) -> str:
 
 
 def institutional_chart(report: InstReport, path: str) -> str:
-    """Grouped bars: daily net buy/sell (in 張) per institutional group with value labels."""
+    """Grouped bars: daily net buy/sell (in 張 or 億元) per institutional group."""
     days = report.days
     x = list(range(len(days)))
     labels = [d.day.strftime("%m/%d") for d in days]
+    scale = report.scale or 1000.0
+    unit = report.unit or "張"
+    is_amount = unit == "億元"
+
+    def _fmt_u(v: float) -> str:
+        return f"{v:+,.1f}" if is_amount else f"{v:+,.0f}"
+
     groups = [
-        ("外資", [d.foreign / 1000.0 for d in days], BLUE),
-        ("投信", [d.trust / 1000.0 for d in days], YELLOW),
-        ("自營商", [d.dealer / 1000.0 for d in days], PURPLE),
+        ("外資", [d.foreign / scale for d in days], BLUE),
+        ("投信", [d.trust / scale for d in days], YELLOW),
+        ("自營商", [d.dealer / scale for d in days], PURPLE),
     ]
 
     fig, ax = plt.subplots(figsize=(10, 6.25), dpi=150)
     fig.patch.set_facecolor(BG)
-    fig.subplots_adjust(top=0.83, bottom=0.10, left=0.05, right=0.90)
+    fig.subplots_adjust(top=0.83, bottom=0.10, left=0.05, right=0.89)
     _style_ax(ax, right_axis=True)
 
     width = 0.26
@@ -398,7 +430,6 @@ def institutional_chart(report: InstReport, path: str) -> str:
         xs = [xi + (i - 1) * width for xi in x]
         ax.bar(xs, values, width=width, label=label, color=color, alpha=0.92, zorder=3)
 
-        # Label the latest day's non-zero bars and the single largest magnitude bar
         peak_idx = max(range(len(values)), key=lambda k: abs(values[k])) if values else -1
         for k in {len(values) - 1, peak_idx}:
             if 0 <= k < len(values) and abs(values[k]) >= max_abs * 0.06:
@@ -406,7 +437,7 @@ def institutional_chart(report: InstReport, path: str) -> str:
                 va = "bottom" if v >= 0 else "top"
                 dy = 4 if v >= 0 else -4
                 ax.annotate(
-                    f"{v:+,.0f}",
+                    _fmt_u(v),
                     xy=(xs[k], v), xytext=(0, dy), textcoords="offset points",
                     color=TEXT, fontsize=7.5, fontweight="bold", ha="center", va=va,
                 )
@@ -414,34 +445,95 @@ def institutional_chart(report: InstReport, path: str) -> str:
     ax.axhline(0, color=TEXT, linewidth=0.9, alpha=0.65, zorder=4)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, color=MUTED, fontsize=8.5)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p=None: f"{v:+,.0f}張" if v != 0 else "0"))
+    ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda v, _p=None: f"{_fmt_u(v)}{unit}" if v != 0 else "0")
+    )
 
-    # Clean two-line header with 10-day cumulative totals (legend never overlaps bars!)
+    market_tag = "（上櫃）" if report.market == "TPEX" else ""
     fig.text(
-        0.05, 0.935, f"{_short(report.name)} ({report.ticker})  三大法人買賣超",
+        0.05, 0.935, f"{_short(report.name)} ({report.ticker})  三大法人買賣超{market_tag}",
         color=TEXT, fontsize=14, fontweight="bold", ha="left", va="center",
     )
     if report.foreign_holding_pct is not None:
         fig.text(
-            0.90, 0.935, f"外資持股 {report.foreign_holding_pct:.2f}%",
+            0.89, 0.935, f"外資持股 {report.foreign_holding_pct:.2f}%",
             color=TEXT, fontsize=11, fontweight="bold", ha="right", va="center",
             bbox=dict(boxstyle="round,pad=0.25", facecolor="#1e293b", edgecolor=GRID),
         )
 
     sums = [
-        ("外資", sum(d.foreign for d in days) / 1000.0, BLUE),
-        ("投信", sum(d.trust for d in days) / 1000.0, YELLOW),
-        ("自營商", sum(d.dealer for d in days) / 1000.0, PURPLE),
+        ("外資", sum(d.foreign for d in days) / scale, BLUE),
+        ("投信", sum(d.trust for d in days) / scale, YELLOW),
+        ("自營商", sum(d.dealer for d in days) / scale, PURPLE),
     ]
     x_cursor = 0.05
-    for name, total_lots, col in sums:
+    for name, total_val, col in sums:
         fig.text(
-            x_cursor, 0.875, f"■ {name} {total_lots:+,.0f}張",
+            x_cursor, 0.875, f"■ {name} {_fmt_u(total_val)}{unit}",
             color=col, fontsize=9.5, fontweight="bold", ha="left", va="center",
         )
-        x_cursor += 0.21
+        x_cursor += 0.22
     fig.text(
-        0.90, 0.875, f"近 {len(days)} 日累計",
+        0.89, 0.875, f"近 {len(days)} 日累計",
         color=MUTED, fontsize=9, ha="right", va="center",
     )
+    return _save(fig, path)
+
+
+def dividend_chart(report: DividendReport, path: str) -> str:
+    """Annual dividend bar chart with 5-year average line and value labels."""
+    years = report.years
+    xs = list(range(len(years)))
+    labels = [str(y.year) for y in years]
+    vals = [y.amount for y in years]
+
+    fig, ax = plt.subplots(figsize=(10, 6.25), dpi=150)
+    fig.patch.set_facecolor(BG)
+    fig.subplots_adjust(top=0.83, bottom=0.10, left=0.05, right=0.89)
+    _style_ax(ax, right_axis=True)
+
+    max_v = max(vals, default=1.0) or 1.0
+    ax.set_ylim(0, max_v * 1.24)
+
+    bar_colors = [BLUE if i < len(vals) - 1 else "#f59e0b" for i in range(len(vals))]
+    ax.bar(xs, vals, width=0.52, color=bar_colors, alpha=0.92, zorder=3)
+    for xi, v in zip(xs, vals):
+        ax.annotate(
+            f"{v:.2f}",
+            xy=(xi, v), xytext=(0, 5), textcoords="offset points",
+            color=TEXT, fontsize=8.5, fontweight="bold", ha="center", va="bottom",
+        )
+
+    if report.avg_5y > 0:
+        ax.axhline(report.avg_5y, color="#2ebd85", linewidth=1.1, linestyle="--", alpha=0.8, zorder=4)
+        ax.text(
+            0.01, report.avg_5y, f" 近5年平均 {report.avg_5y:.2f}",
+            transform=ax.get_yaxis_transform(),
+            color="#2ebd85", fontsize=8.5, fontweight="bold", va="bottom", ha="left",
+            bbox=dict(boxstyle="round,pad=0.16", facecolor=PANEL, edgecolor="none", alpha=0.85),
+        )
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, color=MUTED, fontsize=9)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p=None: f"{v:.2f}"))
+
+    unit = "元" if report.quote.is_taiwan else report.quote.currency
+    fig.text(
+        0.05, 0.935, f"{_short(report.quote.name)} ({report.quote.ticker})  歷年股利政策",
+        color=TEXT, fontsize=14, fontweight="bold", ha="left", va="center",
+    )
+    if report.yield_pct is not None:
+        fig.text(
+            0.89, 0.935, f"預估殖利率 {report.yield_pct:.2f}%",
+            color="#2ebd85", fontsize=11, fontweight="bold", ha="right", va="center",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#1e293b", edgecolor=GRID),
+        )
+
+    ex_str = f"最新除息 {report.latest_ex_date:%Y/%m/%d}" if report.latest_ex_date else ""
+    fig.text(
+        0.05, 0.875,
+        f"最新年度 {report.latest_amount:.2f} {unit}   •   近5年均 {report.avg_5y:.2f} {unit}",
+        color=MUTED, fontsize=9.5, ha="left", va="center",
+    )
+    fig.text(0.89, 0.875, ex_str, color=MUTED, fontsize=9, ha="right", va="center")
     return _save(fig, path)

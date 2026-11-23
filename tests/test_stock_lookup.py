@@ -213,24 +213,59 @@ class CommandParsingAndHandlingTests(unittest.TestCase):
                 foreign=100000, trust=20000, dealer=-5000, total=115000,
             )],
             foreign_holding_pct=12.34,
+            unit="張",
+            scale=1000.0,
+            market="TWSE",
         )
         with mock.patch.object(self.main.institutional, "fetch", return_value=fake_report) as fetch_mock, \
              mock.patch.object(self.main.charts, "institutional_chart"), \
              mock.patch.object(self.main, "_base_url", return_value="https://example.com"):
             msgs = self.main._handle_command("T", "玉晶光")
-            fetch_mock.assert_called_once_with("3406")
+            fetch_mock.assert_called_once_with("3406", market="TWSE")
             self.assertEqual(len(msgs), 1)
             self.assertIn("玉晶光 (3406)", msgs[0].alt_text)
 
+    def test_v2_command_parsing(self) -> None:
+        parse = self.main._parse_command
+        self.assertEqual(parse("#2330"), ("#", "2330"))
+        self.assertEqual(parse("#台積電"), ("#", "台積電"))
+        self.assertEqual(parse("# BTC"), ("#", "BTC"))
+        self.assertEqual(parse("KW2330"), ("KW", "2330"))
+        self.assertEqual(parse("kw台積電"), ("KW", "台積電"))
+        self.assertEqual(parse("KMAAPL"), ("KM", "AAPL"))
+        self.assertEqual(parse("KM AAPL"), ("KM", "AAPL"))
+        self.assertEqual(parse("D2330"), ("D", "2330"))
+        self.assertEqual(parse("D台積電"), ("D", "台積電"))
+        self.assertEqual(parse("F2330"), ("F", "2330"))
+        self.assertEqual(parse("F玉晶光"), ("F", "玉晶光"))
+        self.assertEqual(parse("T台股"), ("T", "台股"))
+        self.assertEqual(parse("P外匯"), ("P", "外匯"))
+        self.assertEqual(parse("PUSD/TWD"), ("P", "USD/TWD"))
+        self.assertEqual(parse("PBTC"), ("P", "BTC"))
+
+    def test_cross_asset_aliases(self) -> None:
+        from app.stock import aliases
+        self.assertEqual(aliases.lookup("台股").yahoo_symbol, "^TWII")
+        self.assertEqual(aliases.lookup("比特幣").yahoo_symbol, "BTC-USD")
+        self.assertEqual(aliases.lookup("USD/TWD").yahoo_symbol, "TWD=X")
+        self.assertEqual(aliases.lookup("USD/NTD").yahoo_symbol, "TWD=X")
+        self.assertEqual(aliases.lookup("AUD/TWD").yahoo_symbol, "AUDTWD=X")
+        self.assertTrue(aliases.is_fx_overview("外匯"))
+        self.assertTrue(aliases.is_taiwan_market("台股"))
+
     def test_parse_postback(self) -> None:
         self.assertEqual(self.main._parse_postback("cmd=K&q=7822"), ("K", "7822"))
+        self.assertEqual(self.main._parse_postback("cmd=KW&q=7822"), ("KW", "7822"))
+        self.assertEqual(self.main._parse_postback("cmd=D&q=2330"), ("D", "2330"))
+        self.assertEqual(self.main._parse_postback("cmd=F&q=2330"), ("F", "2330"))
+        self.assertEqual(self.main._parse_postback("cmd=%23&q=2330"), ("#", "2330"))
         self.assertEqual(self.main._parse_postback("cmd=t&q=2330"), ("T", "2330"))
         self.assertIsNone(self.main._parse_postback("cmd=X&q=2330"))
         self.assertIsNone(self.main._parse_postback(""))
 
     def test_postback_triggers_command_and_replies(self) -> None:
         event = types.SimpleNamespace(
-            postback=types.SimpleNamespace(data="cmd=K&q=7822"),
+            postback=types.SimpleNamespace(data="cmd=KW&q=7822"),
             source=types.SimpleNamespace(type="user", user_id="U123"),
             reply_token="tok",
         )
@@ -239,8 +274,28 @@ class CommandParsingAndHandlingTests(unittest.TestCase):
              mock.patch.object(self.main, "_reply") as reply_mock:
             self.main.on_postback(event)
             load_mock.assert_called_once_with(event)
-            handle_mock.assert_called_once_with("K", "7822")
+            handle_mock.assert_called_once_with("KW", "7822")
             reply_mock.assert_called_once_with("tok", ["CARD"])
+
+    def test_direct_chat_bare_stock_name_triggers_quick_quote(self) -> None:
+        event = types.SimpleNamespace(
+            message=types.SimpleNamespace(text="玉晶光"),
+            source=types.SimpleNamespace(type="user", user_id="U123"),
+            reply_token="tok",
+        )
+        with mock.patch.object(self.main, "_execute_and_reply") as exec_mock:
+            self.main.on_message(event)
+            exec_mock.assert_called_once_with(event, "#", "玉晶光", False)
+
+    def test_group_chat_bare_stock_name_stays_quiet(self) -> None:
+        event = types.SimpleNamespace(
+            message=types.SimpleNamespace(text="玉晶光"),
+            source=types.SimpleNamespace(type="group"),
+            reply_token="tok",
+        )
+        with mock.patch.object(self.main, "_execute_and_reply") as exec_mock:
+            self.main.on_message(event)
+            exec_mock.assert_not_called()
 
 
 class _FakeSeries:
