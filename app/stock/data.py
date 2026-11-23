@@ -1,30 +1,74 @@
-"""Stock data fetching: Yahoo Finance for prices (TW + US), TWSE for institutional data."""
+"""Stock & cross-asset data fetching via Yahoo Finance + Taiwan stock directory."""
 from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import date
 
 import pandas as pd
 import yfinance as yf
 
-from app.stock import tw_directory
+from app.stock import aliases, tw_directory
 
 log = logging.getLogger(__name__)
 _HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
+_OHLC = ("Open", "High", "Low", "Close")
+
+KLINE_SPECS: dict[str, tuple[str, str, str]] = {
+    # key -> (yf_period, yf_interval, label)
+    "D": ("6mo", "1d", "日K 近6個月"),
+    "W": ("2y", "1wk", "週K 近2年"),
+    "M": ("5y", "1mo", "月K 近5年"),
+}
 
 
 class StockNotFoundError(Exception):
     """Raised when a ticker cannot be resolved to any market."""
 
 
+class DividendDataUnavailable(Exception):
+    """Raised when a symbol has no dividend history."""
+
+
 @dataclass
 class StockQuote:
-    ticker: str          # user-facing ticker, e.g. "2330" or "AAPL"
-    yahoo_symbol: str    # e.g. "2330.TW" or "AAPL"
+    ticker: str          # user-facing ticker, e.g. "2330", "AAPL", "BTC", "台股"
+    yahoo_symbol: str    # e.g. "2330.TW", "AAPL", "BTC-USD", "^TWII"
     name: str
     is_taiwan: bool
     currency: str
+    asset_type: str = "stock"  # "stock", "index", "crypto", "fx", "commodity"
+
+
+@dataclass
+class QuickSnapshot:
+    quote: StockQuote
+    price: float
+    prev_close: float | None
+    open_price: float | None
+    high_price: float | None
+    low_price: float | None
+    volume: float
+    as_of: str
+
+
+@dataclass
+class AnnualDividend:
+    year: int
+    amount: float
+
+
+@dataclass
+class DividendReport:
+    quote: StockQuote
+    current_price: float | None
+    years: list[AnnualDividend] = field(default_factory=list)
+    latest_ex_date: date | None = None
+    latest_amount: float = 0.0
+    avg_5y: float = 0.0
+    yield_pct: float | None = None
 
 
 def _has_data(symbol: str) -> bool:
@@ -35,12 +79,29 @@ def _has_data(symbol: str) -> bool:
         return False
 
 
+def _is_missing(val) -> bool:
+    return bool(pd.isna(val))
+
+
 def resolve(ticker: str) -> StockQuote:
-    """Map a user ticker or Taiwan stock name to a Yahoo Finance symbol."""
+    """Map a user ticker, Taiwan stock name, or cross-asset alias to a Yahoo Finance symbol."""
     raw = ticker.strip()
     if not raw:
         raise StockNotFoundError(ticker)
 
+    # 1. Cross-asset aliases (台股, BTC, USD/TWD, SOX, GOLD, ...)
+    alias = aliases.lookup(raw)
+    if alias is not None:
+        return StockQuote(
+            ticker=alias.ticker,
+            yahoo_symbol=alias.yahoo_symbol,
+            name=alias.name,
+            is_taiwan=alias.is_taiwan,
+            currency=alias.currency,
+            asset_type=alias.asset_type,
+        )
+
+    # 2. Taiwan stock directory (TWSE / TPEx / ESB by code or Chinese name)
     tw = tw_directory.lookup(raw)
     if tw is not None:
         alt_suffix = ".TWO" if tw.yahoo_suffix == ".TW" else ".TW"
@@ -52,12 +113,14 @@ def resolve(ticker: str) -> StockQuote:
                     name=tw.name,
                     is_taiwan=True,
                     currency="TWD",
+                    asset_type="stock",
                 )
         raise StockNotFoundError(raw)
 
     if _HAS_CJK.search(raw):
         raise StockNotFoundError(raw)
 
+    # 3. Direct Yahoo symbol (US stocks or fallback Taiwan numeric code)
     code = raw.upper()
     is_taiwan = code.isdigit()
     candidates = [f"{code}.TW", f"{code}.TWO"] if is_taiwan else [code]
@@ -72,17 +135,16 @@ def resolve(ticker: str) -> StockQuote:
             currency = info.get("currency") or currency
         except Exception:
             log.warning("info lookup failed for %s", symbol, exc_info=True)
-        return StockQuote(ticker=code, yahoo_symbol=symbol, name=name,
-                          is_taiwan=is_taiwan, currency=currency)
+        return StockQuote(
+            ticker=code,
+            yahoo_symbol=symbol,
+            name=name,
+            is_taiwan=is_taiwan,
+            currency=currency,
+            asset_type="stock",
+        )
 
     raise StockNotFoundError(raw)
-
-
-_OHLC = ("Open", "High", "Low", "Close")
-
-
-def _is_missing(val) -> bool:
-    return bool(pd.isna(val))
 
 
 def _backfill_latest_bar(tk: yf.Ticker, df: pd.DataFrame) -> pd.DataFrame:
@@ -128,11 +190,13 @@ def _backfill_latest_bar(tk: yf.Ticker, df: pd.DataFrame) -> pd.DataFrame:
 
 
 def intraday(quote: StockQuote) -> tuple[pd.DataFrame, float | None]:
-    """1-minute bars for the most recent trading day, plus previous close."""
+    """1-minute (or 5-minute fallback) bars for the most recent trading day, plus previous close."""
     tk = yf.Ticker(quote.yahoo_symbol)
     df = tk.history(period="1d", interval="1m")
     if df.empty:
         df = tk.history(period="5d", interval="5m")
+        if df.empty:
+            df = tk.history(period="5d", interval="15m")
         if df.empty:
             raise StockNotFoundError(quote.ticker)
         last_day = df.index[-1].date()
@@ -150,8 +214,25 @@ def intraday(quote: StockQuote) -> tuple[pd.DataFrame, float | None]:
     return df, prev_close
 
 
+def kline_history(quote: StockQuote, timeframe: str = "D") -> pd.DataFrame:
+    """OHLCV history for daily ('D'), weekly ('W'), or monthly ('M') candlestick charts."""
+    tf = timeframe.upper()
+    period, interval, _ = KLINE_SPECS.get(tf, KLINE_SPECS["D"])
+    tk = yf.Ticker(quote.yahoo_symbol)
+    df = tk.history(period=period, interval=interval)
+    if df.empty:
+        raise StockNotFoundError(quote.ticker)
+    df = _backfill_latest_bar(tk, df)
+    ohlc_cols = [c for c in _OHLC if c in df.columns]
+    if ohlc_cols:
+        df = df.dropna(subset=ohlc_cols)
+    if df.empty:
+        raise StockNotFoundError(quote.ticker)
+    return df
+
+
 def daily_history(quote: StockQuote, months: int = 6) -> pd.DataFrame:
-    """Daily OHLCV for candlestick charts."""
+    """Daily OHLCV for candlestick charts (kept for backward compatibility)."""
     tk = yf.Ticker(quote.yahoo_symbol)
     df = tk.history(period=f"{months}mo", interval="1d")
     if df.empty:
@@ -163,3 +244,100 @@ def daily_history(quote: StockQuote, months: int = 6) -> pd.DataFrame:
     if df.empty:
         raise StockNotFoundError(quote.ticker)
     return df
+
+
+def quick_quote(quote: StockQuote) -> QuickSnapshot:
+    """Fast quote snapshot without rendering any chart."""
+    tk = yf.Ticker(quote.yahoo_symbol)
+    daily = tk.history(period="5d", interval="1d")
+    if daily.empty:
+        raise StockNotFoundError(quote.ticker)
+    daily = _backfill_latest_bar(tk, daily).dropna(subset=["Close"])
+    if daily.empty:
+        raise StockNotFoundError(quote.ticker)
+
+    last_row = daily.iloc[-1]
+    price = float(last_row["Close"])
+    prev_close = float(daily["Close"].iloc[-2]) if len(daily) >= 2 else None
+    open_px = float(last_row["Open"]) if "Open" in daily.columns and not _is_missing(last_row["Open"]) else None
+    high_px = float(last_row["High"]) if "High" in daily.columns and not _is_missing(last_row["High"]) else None
+    low_px = float(last_row["Low"]) if "Low" in daily.columns and not _is_missing(last_row["Low"]) else None
+    vol = float(last_row["Volume"]) if "Volume" in daily.columns and not _is_missing(last_row["Volume"]) else 0.0
+    as_of = daily.index[-1].strftime("%Y/%m/%d")
+
+    return QuickSnapshot(
+        quote=quote,
+        price=price,
+        prev_close=prev_close,
+        open_price=open_px,
+        high_price=high_px,
+        low_price=low_px,
+        volume=vol,
+        as_of=as_of,
+    )
+
+
+def dividends(quote: StockQuote, max_years: int = 10) -> DividendReport:
+    """Annual dividend history and estimated yield for a stock or ETF."""
+    tk = yf.Ticker(quote.yahoo_symbol)
+    divs = tk.dividends
+    if divs is None or divs.empty:
+        raise DividendDataUnavailable(quote.ticker)
+
+    divs = divs[divs > 0]
+    if divs.empty:
+        raise DividendDataUnavailable(quote.ticker)
+
+    by_year = divs.groupby(divs.index.year).sum()
+    years = [AnnualDividend(year=int(y), amount=float(v)) for y, v in by_year.items()][-max_years:]
+    latest_ex_date = divs.index[-1].date()
+
+    # Latest full/trailing 12-month dividend sum for realistic yield estimate
+    cutoff = divs.index[-1] - pd.Timedelta(days=365)
+    ttm_div = float(divs[divs.index > cutoff].sum())
+    latest_amount = years[-1].amount
+
+    recent5 = years[-5:]
+    avg_5y = sum(x.amount for x in recent5) / len(recent5) if recent5 else 0.0
+
+    current_price = None
+    try:
+        hist = tk.history(period="5d", interval="1d")
+        hist = _backfill_latest_bar(tk, hist).dropna(subset=["Close"])
+        if not hist.empty:
+            current_price = float(hist["Close"].iloc[-1])
+    except Exception:
+        log.warning("dividend price lookup failed for %s", quote.yahoo_symbol, exc_info=True)
+
+    yield_pct = (ttm_div / current_price * 100.0) if (current_price and current_price > 0 and ttm_div > 0) else None
+
+    return DividendReport(
+        quote=quote,
+        current_price=current_price,
+        years=years,
+        latest_ex_date=latest_ex_date,
+        latest_amount=latest_amount,
+        avg_5y=avg_5y,
+        yield_pct=yield_pct,
+    )
+
+
+def fx_overview() -> list[QuickSnapshot]:
+    """Fetch key international FX pairs in parallel."""
+    quotes = [
+        StockQuote(a.ticker, a.yahoo_symbol, a.name, a.is_taiwan, a.currency, a.asset_type)
+        for a in aliases.FX_OVERVIEW_PAIRS
+    ]
+
+    def _safe_quote(q: StockQuote) -> QuickSnapshot | None:
+        try:
+            return quick_quote(q)
+        except Exception:
+            log.warning("FX quote failed for %s", q.yahoo_symbol, exc_info=True)
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(quotes)) as pool:
+        results = [r for r in pool.map(_safe_quote, quotes) if r is not None]
+    if not results:
+        raise StockNotFoundError("外匯")
+    return results
