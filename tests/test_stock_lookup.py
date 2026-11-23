@@ -209,17 +209,38 @@ class CommandParsingAndHandlingTests(unittest.TestCase):
             ticker="3406",
             name="玉晶光",
             days=[types.SimpleNamespace(
-                day=mock.MagicMock(__format__=lambda *a: "2026-11-20"),
+                day=datetime.date(2026, 11, 20),
                 foreign=100000, trust=20000, dealer=-5000, total=115000,
             )],
             foreign_holding_pct=12.34,
         )
         with mock.patch.object(self.main.institutional, "fetch", return_value=fake_report) as fetch_mock, \
-             mock.patch.object(self.main.charts, "institutional_chart"):
+             mock.patch.object(self.main.charts, "institutional_chart"), \
+             mock.patch.object(self.main, "_base_url", return_value="https://example.com"):
             msgs = self.main._handle_command("T", "玉晶光")
             fetch_mock.assert_called_once_with("3406")
-            self.assertEqual(len(msgs), 2)
-            self.assertIn("玉晶光 (3406)", msgs[1].text)
+            self.assertEqual(len(msgs), 1)
+            self.assertIn("玉晶光 (3406)", msgs[0].alt_text)
+
+    def test_parse_postback(self) -> None:
+        self.assertEqual(self.main._parse_postback("cmd=K&q=7822"), ("K", "7822"))
+        self.assertEqual(self.main._parse_postback("cmd=t&q=2330"), ("T", "2330"))
+        self.assertIsNone(self.main._parse_postback("cmd=X&q=2330"))
+        self.assertIsNone(self.main._parse_postback(""))
+
+    def test_postback_triggers_command_and_replies(self) -> None:
+        event = types.SimpleNamespace(
+            postback=types.SimpleNamespace(data="cmd=K&q=7822"),
+            source=types.SimpleNamespace(type="user", user_id="U123"),
+            reply_token="tok",
+        )
+        with mock.patch.object(self.main, "_handle_command", return_value=["CARD"]) as handle_mock, \
+             mock.patch.object(self.main, "_start_loading") as load_mock, \
+             mock.patch.object(self.main, "_reply") as reply_mock:
+            self.main.on_postback(event)
+            load_mock.assert_called_once_with(event)
+            handle_mock.assert_called_once_with("K", "7822")
+            reply_mock.assert_called_once_with("tok", ["CARD"])
 
 
 class _FakeSeries:
