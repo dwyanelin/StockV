@@ -1,9 +1,9 @@
 """StockV — LINE stock analytics bot.
 
-Commands (case-insensitive, no spaces):
-  P{ticker}  intraday price chart          e.g. P2330, PAAPL
-  K{ticker}  daily candlestick, 6 months   e.g. K2330, KTSLA
-  T{ticker}  institutional net buy/sell    e.g. T2330 (Taiwan listed only)
+Commands (case-insensitive):
+  P{ticker|name}  intraday price chart          e.g. P2330, P玉晶光, PAAPL
+  K{ticker|name}  daily candlestick, 6 months   e.g. K2330, K玉晶光, KTSLA
+  T{ticker|name}  institutional net buy/sell    e.g. T2330, T台積電 (Taiwan listed only)
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 from app import config
-from app.stock import charts, data, institutional
+from app.stock import charts, data, institutional, tw_directory
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("stockv")
@@ -39,21 +39,34 @@ line_config = Configuration(access_token=config.LINE_CHANNEL_ACCESS_TOKEN)
 
 os.makedirs(config.CHART_DIR, exist_ok=True)
 
-_COMMAND = re.compile(r"^([PKT])([0-9A-Z.\-]{1,10})$", re.IGNORECASE)
+_HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
+_COMMAND = re.compile(
+    r"^([PKT])(?:\s*([\u4e00-\u9fff][^\s]{0,19})|\s*(\d[0-9A-Za-z]{2,6})|([0-9A-Za-z][^\s]{0,19}))$",
+    re.IGNORECASE,
+)
 _HELP_WORDS = {"help", "幫助", "指令", "說明", "使用說明"}
 
 HELP_TEXT = (
     "📈 StockV 指令說明\n"
     "──────────────\n"
-    "P+代號｜當日走勢圖\n"
-    "　例：P2330、PAAPL\n"
-    "K+代號｜日K線圖（近6個月）\n"
-    "　例：K2330、KTSLA\n"
-    "T+代號｜三大法人買賣超（台股上市）\n"
-    "　例：T2330\n"
+    "P+代號/股名｜當日走勢圖\n"
+    "　例：P2330、P玉晶光、PAAPL\n"
+    "K+代號/股名｜日K線圖（近6個月）\n"
+    "　例：K2330、K玉晶光、KTSLA\n"
+    "T+代號/股名｜三大法人買賣超（台股上市）\n"
+    "　例：T2330、T台積電\n"
     "──────────────\n"
-    "台股輸入數字代號，美股輸入英文代號"
+    "台股支援代號或中文簡稱，美股輸入英文代號"
 )
+
+
+def _parse_command(text: str) -> tuple[str, str] | None:
+    """Parse a P/K/T command into (kind, query), or None if not a command."""
+    m = _COMMAND.match(text.strip())
+    if not m:
+        return None
+    target = m.group(2) or m.group(3) or m.group(4)
+    return m.group(1).upper(), target
 
 _base_url_from_request: str = ""
 
@@ -84,14 +97,21 @@ def _fmt_lots(shares: float) -> str:
     return f"{lots:+,.0f}"
 
 
-def _handle_command(kind: str, ticker: str) -> list:
+def _handle_command(kind: str, query: str) -> list:
     """Build LINE reply messages for one command. Raises on data errors."""
     kind = kind.upper()
-    ticker = ticker.upper()
+    query = query.strip()
 
     if kind == "T":
-        if not ticker.isdigit():
-            return [TextMessage(text="T 指令僅支援台股（數字代號），例如 T2330")]
+        tw = tw_directory.lookup(query)
+        if tw is not None:
+            ticker = tw.code
+        elif query.isdigit():
+            ticker = query
+        elif _HAS_CJK.search(query):
+            raise data.StockNotFoundError(query)
+        else:
+            return [TextMessage(text="T 指令僅支援台股（代號或名稱），例如 T2330、T台積電")]
         report = institutional.fetch(ticker)
         path, url = _new_chart_path()
         charts.institutional_chart(report, path)
@@ -111,7 +131,7 @@ def _handle_command(kind: str, ticker: str) -> list:
             TextMessage(text="\n".join(lines)),
         ]
 
-    quote = data.resolve(ticker)
+    quote = data.resolve(query)
     path, url = _new_chart_path()
     if kind == "P":
         df, prev_close = data.intraday(quote)
@@ -126,22 +146,26 @@ def _handle_command(kind: str, ticker: str) -> list:
 def on_message(event: MessageEvent) -> None:
     text = event.message.text.strip()
     messages = None
+    is_group = getattr(getattr(event, "source", None), "type", "user") != "user"
 
     if text.lower() in _HELP_WORDS:
         messages = [TextMessage(text=HELP_TEXT)]
     else:
-        m = _COMMAND.match(text)
-        if not m:
+        parsed = _parse_command(text)
+        if not parsed:
             return  # not for us — stay quiet in group chats
-        kind, ticker = m.group(1), m.group(2)
+        kind, query = parsed
         try:
             _cleanup_charts()
-            messages = _handle_command(kind, ticker)
+            messages = _handle_command(kind, query)
         except data.StockNotFoundError:
-            messages = [TextMessage(text=f"❓ 找不到「{ticker}」的股價資料，請確認代號是否正確。")]
+            if is_group and _HAS_CJK.search(query):
+                return  # avoid false positives on casual Chinese chat in groups
+            messages = [TextMessage(
+                text=f"❓ 找不到「{query}」的股價資料，請確認代號或名稱是否正確。")]
         except institutional.InstitutionalDataUnavailable:
             messages = [TextMessage(
-                text=f"❓ 查不到「{ticker}」的法人資料（目前僅支援台股上市股票）。")]
+                text=f"❓ 查不到「{query}」的法人資料（目前僅支援台股上市股票）。")]
         except Exception:
             log.exception("command failed: %s", text)
             messages = [TextMessage(text="⚠️ 系統忙碌中，請稍後再試一次。")]

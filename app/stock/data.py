@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 import pandas as pd
 import yfinance as yf
 
+from app.stock import tw_directory
+
 log = logging.getLogger(__name__)
+_HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
 
 
 class StockNotFoundError(Exception):
@@ -32,25 +36,46 @@ def _has_data(symbol: str) -> bool:
 
 
 def resolve(ticker: str) -> StockQuote:
-    """Map a user ticker to a Yahoo symbol. Digits = Taiwan (.TW then .TWO), letters = US."""
-    ticker = ticker.strip().upper()
-    is_taiwan = ticker.isdigit()
-    candidates = [f"{ticker}.TW", f"{ticker}.TWO"] if is_taiwan else [ticker]
+    """Map a user ticker or Taiwan stock name to a Yahoo Finance symbol."""
+    raw = ticker.strip()
+    if not raw:
+        raise StockNotFoundError(ticker)
+
+    tw = tw_directory.lookup(raw)
+    if tw is not None:
+        alt_suffix = ".TWO" if tw.yahoo_suffix == ".TW" else ".TW"
+        for symbol in (tw.yahoo_symbol, f"{tw.code}{alt_suffix}"):
+            if _has_data(symbol):
+                return StockQuote(
+                    ticker=tw.code,
+                    yahoo_symbol=symbol,
+                    name=tw.name,
+                    is_taiwan=True,
+                    currency="TWD",
+                )
+        raise StockNotFoundError(raw)
+
+    if _HAS_CJK.search(raw):
+        raise StockNotFoundError(raw)
+
+    code = raw.upper()
+    is_taiwan = code.isdigit()
+    candidates = [f"{code}.TW", f"{code}.TWO"] if is_taiwan else [code]
 
     for symbol in candidates:
         if not _has_data(symbol):
             continue
-        name, currency = ticker, "TWD" if is_taiwan else "USD"
+        name, currency = code, "TWD" if is_taiwan else "USD"
         try:
             info = yf.Ticker(symbol).info
-            name = info.get("longName") or info.get("shortName") or ticker
+            name = info.get("longName") or info.get("shortName") or code
             currency = info.get("currency") or currency
         except Exception:
             log.warning("info lookup failed for %s", symbol, exc_info=True)
-        return StockQuote(ticker=ticker, yahoo_symbol=symbol, name=name,
+        return StockQuote(ticker=code, yahoo_symbol=symbol, name=name,
                           is_taiwan=is_taiwan, currency=currency)
 
-    raise StockNotFoundError(ticker)
+    raise StockNotFoundError(raw)
 
 
 def intraday(quote: StockQuote) -> tuple[pd.DataFrame, float | None]:
