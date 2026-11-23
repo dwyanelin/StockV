@@ -580,7 +580,6 @@ def fundamental_card(report: FundamentalReport) -> FlexMessage:
     if report.margin is not None:
         m = report.margin
         m_chg = f"{m.margin_change:+,.0f}" if m.margin_change is not None else "--"
-        s_chg = f"{m.short_change:+,.0f}" if m.short_change is not None else "--"
         body.append({"type": "separator", "color": _BORDER})
         body.append({"type": "text", "text": "融資融券（張）", "size": "xs", "weight": "bold", "color": _ACCENT})
         body.append(

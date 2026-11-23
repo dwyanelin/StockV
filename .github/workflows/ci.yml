@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint with Ruff
+        run: ruff check app tests
+
+      - name: Run tests with coverage (global & per-file >= 90%)
+        run: |
+          pytest --cov --cov-report=term-missing --cov-report=json
+          python -c "import json, sys; d = json.load(open('coverage.json'))['files']; bad = [(f, v['summary']['percent_covered']) for f, v in d.items() if v['summary']['percent_covered'] < 90.0]; print('\n'.join(f'FAIL {f}: {p:.2f}% < 90%' for f, p in bad)) if bad else print('All tracked files >= 90% coverage'); sys.exit(1 if bad else 0)"

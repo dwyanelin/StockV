@@ -224,7 +224,7 @@ def fetch_market(num_days: int = 10) -> InstReport:
         scale=1e8,
         market="MARKET",
     )
-    for d, entry in zip(weekdays, results):
+    for d, entry in zip(weekdays, results, strict=False):
         if entry is not None:
             foreign, trust, dealer, total = entry
             report.days.append(InstDay(d, foreign, trust, dealer, total))
@@ -250,7 +250,7 @@ def fetch(ticker: str, num_days: int = 10, market: str | None = None) -> InstRep
         tables = list(pool.map(_t86_table, weekdays))
 
     report = InstReport(ticker=ticker, name=ticker, market="TWSE")
-    for d, table in zip(weekdays, tables):
+    for d, table in zip(weekdays, tables, strict=False):
         if table and ticker in table:
             name, foreign, trust, dealer, total = table[ticker]
             report.days.append(InstDay(d, foreign, trust, dealer, total))
@@ -274,7 +274,7 @@ def _fetch_tpex(ticker: str, weekdays: list[date], num_days: int) -> InstReport:
         tables = list(pool.map(_tpex_table, weekdays))
 
     report = InstReport(ticker=ticker, name=ticker, market="TPEX")
-    for d, table in zip(weekdays, tables):
+    for d, table in zip(weekdays, tables, strict=False):
         if table and ticker in table:
             name, foreign, trust, dealer, total = table[ticker]
             report.days.append(InstDay(d, foreign, trust, dealer, total))

@@ -308,7 +308,7 @@ class _FakeSeries:
 
 
 class _FakeLoc:
-    def __init__(self, df: "_FakeDF"):
+    def __init__(self, df: _FakeDF):
         self._df = df
 
     def __getitem__(self, key):
@@ -341,10 +341,10 @@ class _FakeDF:
     def __getitem__(self, col: str) -> _FakeSeries:
         return _FakeSeries(self._data[col])
 
-    def copy(self) -> "_FakeDF":
+    def copy(self) -> _FakeDF:
         return _FakeDF(self.index, self._data)
 
-    def dropna(self, subset: list[str]) -> "_FakeDF":
+    def dropna(self, subset: list[str]) -> _FakeDF:
         keep = [
             i for i in range(len(self.index))
             if all(

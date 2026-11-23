@@ -47,3 +47,12 @@ Rules:
 • I don't just want it to work—I want it to be something I'm proud to show people
 • This is real. Not a mockup. Not a prototype. A working product.
 • Keep me in control and in the loop at all times
+
+Testing & Coverage Policy (Mandatory for Every Session):
+• Whenever adding features, fixing bugs, or refactoring core logic (`app/main.py`, `app/flex.py`, `app/config.py`, `app/stock/aliases.py`, `app/stock/tw_directory.py`, `app/stock/data.py`, `app/stock/fundamentals.py`, `app/stock/institutional.py`, or any new core module under `app/`), ALWAYS add or update pytest unit tests under `tests/`.
+• New core modules under `app/` are automatically tracked by `[tool.coverage.run]` in `pyproject.toml` (with `branch = true`). Do NOT add core business logic modules to `omit`.
+• For visual chart rendering (`app/stock/charts.py`), do NOT write brittle pixel/axes mocks just to chase 100% line coverage. Instead, maintain PNG smoke tests (`tests/test_charts_smoke.py`) and extract any non-trivial pure logic into testable helper functions.
+• Keep production (`requirements.txt`, used by `Dockerfile`) and development/test dependencies (`requirements-dev.txt`) strictly separated.
+• Before finishing any development task or opening/merging a PR, ALWAYS run:
+  1. `.venv/bin/ruff check app tests` (0 lint errors)
+  2. `.venv/bin/pytest --cov --cov-report=term-missing` (all tests pass, total coverage ≥ 90% with branch coverage enabled, and every tracked core module individually ≥ 90%)
