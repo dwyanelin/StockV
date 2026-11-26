@@ -60,10 +60,16 @@ LINE_CHANNEL_SECRET=<Basic settings 頁的 Channel secret>
 LINE_CHANNEL_ACCESS_TOKEN=<Messaging API 頁的 Channel access token>
 ```
 
-## 部署（更新程式後）
+## 部署（CI/CD 自動部署）
+
+每次 PR 合併至 `main` 後，GitHub Actions（`.github/workflows/ci.yml`）會自動執行：
+1. **CI 檢查**：Ruff lint + pytest 單元測試（總覆蓋率與核心模組單檔分支覆蓋率皆須 ≥ 90%）。
+2. **無金鑰自動部署（CD）**：CI 全部通過後，透過 GCP Workload Identity Federation（OIDC，無靜態金鑰）自動建置並部署至 Cloud Run（`max-instances=1`），最後執行健康檢查驗證。
+
+如需手動觸發或從本機緊急部署：
 
 ```bash
-gcloud run deploy stockv --source . --region asia-east1 --project stockv-linebot
+gcloud run deploy stockv --source . --region asia-east1 --project stockv-linebot --max-instances=1
 ```
 
 環境變數已存在服務設定中，重新部署不會遺失。若要更改：
