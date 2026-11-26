@@ -153,6 +153,8 @@ class CommandParsingAndHandlingTests(unittest.TestCase):
     def setUp(self) -> None:
         tw_directory.clear_cache()
         tw_directory._cache = tw_directory._build_index(_sample_stocks())
+        self.main.rate_limiter.reset()
+        self.main.response_cache.clear()
 
     def tearDown(self) -> None:
         tw_directory.clear_cache()

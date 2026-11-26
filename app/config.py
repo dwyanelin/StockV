@@ -9,3 +9,7 @@ BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
 CHART_DIR = os.environ.get("CHART_DIR", "/tmp/stockv-charts")
 CHART_TTL_SECONDS = 30 * 60
+
+USER_COOLDOWN_SECONDS = float(os.environ.get("USER_COOLDOWN_SECONDS", "3"))
+GROUP_CMD_COOLDOWN_SECONDS = float(os.environ.get("GROUP_CMD_COOLDOWN_SECONDS", "30"))
+DAILY_REQUEST_LIMIT = int(os.environ.get("DAILY_REQUEST_LIMIT", "1500"))

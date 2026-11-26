@@ -34,6 +34,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, PostbackEvent, TextMessageContent
 
 from app import config, flex
+from app.guardrails import RateLimiter, ResponseCache
 from app.stock import aliases, charts, data, fundamentals, institutional, tw_directory
 
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +45,13 @@ handler = WebhookHandler(config.LINE_CHANNEL_SECRET or "placeholder")
 line_config = Configuration(access_token=config.LINE_CHANNEL_ACCESS_TOKEN)
 
 os.makedirs(config.CHART_DIR, exist_ok=True)
+
+rate_limiter = RateLimiter(
+    user_cooldown=config.USER_COOLDOWN_SECONDS,
+    group_cmd_cooldown=config.GROUP_CMD_COOLDOWN_SECONDS,
+    daily_limit=config.DAILY_REQUEST_LIMIT,
+)
+response_cache = ResponseCache()
 
 _HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
 _HASH_CMD = re.compile(r"^#\s*([^\s]{1,20})$")
@@ -207,26 +215,67 @@ def _handle_command(kind: str, query: str) -> list:
     return [flex.candlestick_card(quote, df, url, timeframe=tf)]
 
 
+def _canonical_target(query: str) -> str:
+    """Normalize stock name / alias / code to a canonical key for cooldown & caching."""
+    q = query.strip()
+    if aliases.is_fx_overview(q):
+        return "FX_OVERVIEW"
+    alias = aliases.lookup(q)
+    if alias is not None:
+        return alias.ticker.upper()
+    tw = tw_directory.lookup(q)
+    if tw is not None:
+        return tw.code.upper()
+    return q.upper()
+
+
 def _execute_and_reply(event, kind: str, query: str, is_group: bool) -> None:
+    source = getattr(event, "source", None)
+    user_id = getattr(source, "user_id", None)
+    group_id = (
+        getattr(source, "group_id", None) or getattr(source, "room_id", None)
+        if is_group
+        else None
+    )
+    target_key = _canonical_target(query)
+
+    acq = rate_limiter.try_acquire(user_id, group_id, kind, target_key)
+    if not acq.allowed:
+        log.info("throttled %s %s (%s)", kind, target_key, acq.reason)
+        if acq.reason == "daily_limit" and not is_group:
+            _reply(event.reply_token, [TextMessage(text="⚠️ 今日查詢額度已達上限，請明日再試。")])
+        return
+
+    cached = response_cache.get(kind, target_key)
+    if cached is not None:
+        _reply(event.reply_token, cached)
+        return
+
     _start_loading(event)
     try:
         _cleanup_charts()
         messages = _handle_command(kind, query)
+        response_cache.set(kind, target_key, messages)
     except data.StockNotFoundError:
+        rate_limiter.release_group_slot(group_id, kind, target_key)
         if is_group and _HAS_CJK.search(query):
             return  # avoid false positives on casual Chinese chat in groups
         messages = [TextMessage(
             text=f"❓ 找不到「{query}」的報價資料，請確認代號或名稱是否正確。")]
     except institutional.InstitutionalDataUnavailable:
+        rate_limiter.release_group_slot(group_id, kind, target_key)
         messages = [TextMessage(
             text=f"❓ 查不到「{query}」的法人資料（支援台股上市/上櫃股票與 T台股）。")]
     except data.DividendDataUnavailable:
+        rate_limiter.release_group_slot(group_id, kind, target_key)
         messages = [TextMessage(
             text=f"❓ 查不到「{query}」的歷史配息資料。")]
     except fundamentals.FundamentalDataUnavailable:
+        rate_limiter.release_group_slot(group_id, kind, target_key)
         messages = [TextMessage(
             text=f"❓ 查不到「{query}」的基本面資料（僅支援台/美股個股）。")]
     except Exception:
+        rate_limiter.release_group_slot(group_id, kind, target_key)
         log.exception("command failed: %s %s", kind, query)
         messages = [TextMessage(text="⚠️ 系統忙碌中，請稍後再試一次。")]
 
