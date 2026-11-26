@@ -1,13 +1,15 @@
-name: CI
+name: CI / CD
 
 on:
   pull_request:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   test:
+    name: Lint & Test (Coverage >= 90%)
     runs-on: ubuntu-latest
 
     steps:
@@ -35,3 +37,44 @@ jobs:
         run: |
           pytest --cov --cov-report=term-missing --cov-report=json
           python -c "import json, sys; d = json.load(open('coverage.json'))['files']; bad = [(f, v['summary']['percent_covered']) for f, v in d.items() if v['summary']['percent_covered'] < 90.0]; print('\n'.join(f'FAIL {f}: {p:.2f}% < 90%' for f, p in bad)) if bad else print('All tracked files >= 90% coverage'); sys.exit(1 if bad else 0)"
+
+  deploy:
+    name: Deploy to Cloud Run
+    needs: test
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-stockv-prod
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Keyless WIF OIDC)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and Deploy to Cloud Run
+        run: |
+          gcloud run deploy stockv \
+            --source . \
+            --region asia-east1 \
+            --project stockv-linebot \
+            --max-instances 1 \
+            --quiet
+
+      - name: Post-deploy Health Check
+        run: |
+          BODY=$(curl -fsS --retry 3 --retry-delay 3 https://stockv-129246509990.asia-east1.run.app/)
+          echo "Health check response: $BODY"
+          test "$BODY" = "StockV OK"
