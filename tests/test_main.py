@@ -16,6 +16,15 @@ from app import config, main
 from app.stock import data, fundamentals, institutional, tw_directory
 
 
+@pytest.fixture(autouse=True)
+def _reset_guardrails():
+    main.rate_limiter.reset()
+    main.response_cache.clear()
+    yield
+    main.rate_limiter.reset()
+    main.response_cache.clear()
+
+
 def _event(text: str = "", source_type: str = "user", user_id: str = "U123", postback_data: str = ""):
     return SimpleNamespace(
         reply_token="tok-1",
@@ -160,6 +169,7 @@ def test_handle_command_all_kinds(monkeypatch):
     [
         (institutional.InstitutionalDataUnavailable("2330"), "法人資料"),
         (data.DividendDataUnavailable("2330"), "配息資料"),
+        (fundamentals.FundamentalDataBusy("TWSE"), "資料源忙碌中"),
         (fundamentals.FundamentalDataUnavailable("2330"), "基本面資料"),
         (RuntimeError("boom"), "系統忙碌中"),
     ],

@@ -83,6 +83,17 @@ class ResponseCacheTests(unittest.TestCase):
         self.assertEqual(CACHE_TTL_BY_KIND["D"], 600.0)
         self.assertEqual(CACHE_TTL_BY_KIND["F"], 600.0)
 
+    def test_prune_removes_stale_entries(self) -> None:
+        rl = RateLimiter(user_cooldown=4.0, group_cmd_cooldown=30.0, daily_limit=5000)
+        # Seed >500 user entries and >1000 group entries with old timestamps
+        for i in range(505):
+            rl._user_ts[f"U{i}"] = 1.0
+        for i in range(1005):
+            rl._group_ts[(f"G{i}", "P", "2330")] = 1.0
+        self.assertTrue(rl.try_acquire("U_NEW", "G_NEW", "P", "2330", now=1000.0).allowed)
+        self.assertEqual(len(rl._user_ts), 1)
+        self.assertEqual(len(rl._group_ts), 1)
+
     def test_get_set_and_expiry(self) -> None:
         cache = ResponseCache()
         cache.set("P", "2330", ["P_MSG"], now=100.0)
@@ -97,6 +108,18 @@ class ResponseCacheTests(unittest.TestCase):
 
         self.assertEqual(cache.get("T", "2330", now=699.9), ["T_MSG"])
         self.assertIsNone(cache.get("T", "2330", now=700.0))
+
+    def test_cache_eviction_at_max_entries(self) -> None:
+        cache = ResponseCache(max_entries=2)
+        cache.set("P", "1101", ["A"], now=100.0)   # expires 110
+        cache.set("K", "2330", ["B"], now=101.0)   # expires 131
+        cache.set("T", "3443", ["C"], now=115.0)   # triggers expired eviction of 1101
+        self.assertIsNone(cache.get("P", "1101", now=115.0))
+        self.assertEqual(cache.get("K", "2330", now=115.0), ["B"])
+        # Adding a 3rd active entry evicts the oldest remaining (2330)
+        cache.set("T", "7822", ["D"], now=116.0)
+        self.assertIsNone(cache.get("K", "2330", now=116.0))
+        self.assertEqual(cache.get("T", "7822", now=116.0), ["D"])
 
 
 class MainIntegrationGuardrailTests(unittest.TestCase):
