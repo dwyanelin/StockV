@@ -11,10 +11,37 @@ jobs:
   test:
     name: Lint & Test (Coverage >= 90%)
     runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.changes.outputs.should_deploy }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Detect runtime file changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch -> deploy enabled"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" != "push" ] || [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only HEAD~1 HEAD || true)
+          echo "Changed files:"
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '^(app/|Dockerfile$|requirements\.txt$)'; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Runtime files changed -> deploy enabled"
+          else
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Docs/tests/CI only -> skipping deploy"
+          fi
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7
@@ -41,7 +68,7 @@ jobs:
   deploy:
     name: Deploy to Cloud Run
     needs: test
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: needs.test.outputs.should_deploy == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-stockv-prod
