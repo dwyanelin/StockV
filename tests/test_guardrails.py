@@ -10,17 +10,17 @@ from app.guardrails import CACHE_TTL_BY_KIND, RateLimiter, ResponseCache
 
 
 class RateLimiterTests(unittest.TestCase):
-    def test_user_3s_cooldown(self) -> None:
-        rl = RateLimiter(user_cooldown=3.0, group_cmd_cooldown=30.0, daily_limit=1500)
+    def test_user_4s_cooldown(self) -> None:
+        rl = RateLimiter(user_cooldown=4.0, group_cmd_cooldown=30.0, daily_limit=1500)
         self.assertTrue(rl.try_acquire("U1", None, "P", "2330", now=100.0).allowed)
-        # Same user within 3s blocked even on different command/stock
-        r = rl.try_acquire("U1", None, "K", "AAPL", now=102.5)
+        # Same user within 4s blocked even on different command/stock
+        r = rl.try_acquire("U1", None, "K", "AAPL", now=103.5)
         self.assertFalse(r.allowed)
         self.assertEqual(r.reason, "user_cooldown")
         # Different user is unaffected
-        self.assertTrue(rl.try_acquire("U2", None, "K", "AAPL", now=102.5).allowed)
-        # Same user allowed once 3s elapsed
-        self.assertTrue(rl.try_acquire("U1", None, "K", "AAPL", now=103.0).allowed)
+        self.assertTrue(rl.try_acquire("U2", None, "K", "AAPL", now=103.5).allowed)
+        # Same user allowed once 4s elapsed
+        self.assertTrue(rl.try_acquire("U1", None, "K", "AAPL", now=104.0).allowed)
 
     def test_group_30s_same_stock_cmd_cooldown(self) -> None:
         rl = RateLimiter(user_cooldown=3.0, group_cmd_cooldown=30.0, daily_limit=1500)

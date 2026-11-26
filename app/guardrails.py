@@ -36,14 +36,14 @@ class AcquireResult:
 
 class RateLimiter:
     """Thread-safe atomic rate limiter covering:
-    1. Per-user cooldown (default 3s) — atomic check-and-set also guarantees in-flight dedup.
+    1. Per-user cooldown (default 4s) — atomic check-and-set also guarantees in-flight dedup.
     2. Per-group same (kind, query) cooldown (default 30s).
     3. Daily global hard cap (default 1,500 requests/day, Taiwan time).
     """
 
     def __init__(
         self,
-        user_cooldown: float = 3.0,
+        user_cooldown: float = 4.0,
         group_cmd_cooldown: float = 30.0,
         daily_limit: int = 1500,
     ) -> None:
