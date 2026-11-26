@@ -10,7 +10,7 @@ from datetime import date
 import pandas as pd
 import yfinance as yf
 
-from app.stock import aliases, tw_directory
+from app.stock import aliases, futures, tw_directory
 
 log = logging.getLogger(__name__)
 _HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
@@ -191,6 +191,15 @@ def _backfill_latest_bar(tk: yf.Ticker, df: pd.DataFrame) -> pd.DataFrame:
 
 def intraday(quote: StockQuote) -> tuple[pd.DataFrame, float | None]:
     """1-minute (or 5-minute fallback) bars for the most recent trading day, plus previous close."""
+    if quote.yahoo_symbol.startswith("TAIFEX:"):
+        cid = quote.yahoo_symbol.split(":", 1)[1]
+        try:
+            qinfo, df, prev_close = futures.fetch_intraday(cid)
+        except futures.FuturesDataUnavailable:
+            raise StockNotFoundError(quote.ticker) from None
+        quote.name = qinfo["name"]
+        return df, prev_close
+
     tk = yf.Ticker(quote.yahoo_symbol)
     df = tk.history(period="1d", interval="1m")
     if df.empty:
@@ -216,6 +225,9 @@ def intraday(quote: StockQuote) -> tuple[pd.DataFrame, float | None]:
 
 def kline_history(quote: StockQuote, timeframe: str = "D") -> pd.DataFrame:
     """OHLCV history for daily ('D'), weekly ('W'), or monthly ('M') candlestick charts."""
+    if quote.yahoo_symbol.startswith("TAIFEX:"):
+        # Fallback to Taiwan spot index (^TWII) for multi-month K-line charts
+        quote = StockQuote(quote.ticker, "^TWII", f"{quote.name} (參考加權)", True, "TWD", "index")
     tf = timeframe.upper()
     period, interval, _ = KLINE_SPECS.get(tf, KLINE_SPECS["D"])
     tk = yf.Ticker(quote.yahoo_symbol)
@@ -248,6 +260,24 @@ def daily_history(quote: StockQuote, months: int = 6) -> pd.DataFrame:
 
 def quick_quote(quote: StockQuote) -> QuickSnapshot:
     """Fast quote snapshot without rendering any chart."""
+    if quote.yahoo_symbol.startswith("TAIFEX:"):
+        cid = quote.yahoo_symbol.split(":", 1)[1]
+        try:
+            qinfo = futures.fetch_quote(cid)
+        except futures.FuturesDataUnavailable:
+            raise StockNotFoundError(quote.ticker) from None
+        quote.name = qinfo["name"]
+        return QuickSnapshot(
+            quote=quote,
+            price=qinfo["price"],
+            prev_close=qinfo["prev_close"],
+            open_price=qinfo["open"],
+            high_price=qinfo["high"],
+            low_price=qinfo["low"],
+            volume=qinfo["volume"],
+            as_of=qinfo["as_of"],
+        )
+
     tk = yf.Ticker(quote.yahoo_symbol)
     daily = tk.history(period="5d", interval="1d")
     if daily.empty:
