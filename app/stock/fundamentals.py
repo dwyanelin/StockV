@@ -1,7 +1,9 @@
 """Fundamentals, valuation, monthly revenue, and margin trading data.
 
-- Taiwan stocks (TWSE + TPEx): cached OpenAPI snapshots for PE/PB/Yield,
-  monthly revenue (MoM / YoY / cumulative YoY), and margin/short balances.
+- Taiwan stocks (TWSE / TPEx fetched independently): cached OpenAPI snapshots
+  for PE/PB/Yield, monthly revenue (MoM / YoY / cumulative YoY), and margin/short
+  balances. Strict 6-second wall-clock budget + partial-aware cache TTL prevent
+  stalled upstream endpoints from blocking LINE webhook replies.
 - US stocks: Yahoo Finance .info fundamentals snapshot.
 """
 from __future__ import annotations
@@ -9,7 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import requests
@@ -20,11 +22,29 @@ from app.stock.data import StockQuote
 log = logging.getLogger(__name__)
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (StockV LINE bot)"}
-_CACHE_TTL = 6 * 3600
+_CACHE_TTL = 6 * 3600.0
+_PARTIAL_CACHE_TTL = 30.0
+_FETCH_BUDGET_SECONDS = 6.0
+_LOCK_TIMEOUT_SECONDS = 6.0
+
+_TWSE_URLS = {
+    "val": "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
+    "rev": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+    "mgn": "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN",
+}
+_TPEX_URLS = {
+    "val": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
+    "rev": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+    "mgn": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance",
+}
 
 
 class FundamentalDataUnavailable(Exception):
     """Raised when fundamental data cannot be retrieved for a ticker."""
+
+
+class FundamentalDataBusy(Exception):
+    """Raised when upstream fundamental APIs are busy beyond the lock timeout."""
 
 
 @dataclass
@@ -58,6 +78,7 @@ class FundamentalReport:
     valuation: Valuation | None = None
     revenue: MonthlyRevenue | None = None
     margin: MarginInfo | None = None
+    is_complete: bool = True
     # US-specific extras
     market_cap: float | None = None
     forward_pe: float | None = None
@@ -73,10 +94,18 @@ class _TwFundCache:
     revenue: dict[str, MonthlyRevenue]
     margin: dict[str, MarginInfo]
     loaded_at: float
+    ttl: float = _CACHE_TTL
+    is_complete: bool = True
+
+    def is_fresh(self, now: float) -> bool:
+        return (now - self.loaded_at) < self.ttl
 
 
-_lock = threading.Lock()
-_cache: _TwFundCache | None = None
+_locks: dict[str, threading.Lock] = {
+    "TWSE": threading.Lock(),
+    "TPEX": threading.Lock(),
+}
+_caches: dict[str, _TwFundCache] = {}
 
 
 def _fnum(s) -> float | None:
@@ -100,7 +129,7 @@ def _roc_ym(raw: str) -> str:
 
 def _fetch_list(url: str) -> list[dict]:
     try:
-        r = requests.get(url, headers=_HEADERS, timeout=15)
+        r = requests.get(url, headers=_HEADERS, timeout=(3, 5))
         r.raise_for_status()
         j = r.json()
         return j if isinstance(j, list) else []
@@ -109,31 +138,30 @@ def _fetch_list(url: str) -> list[dict]:
         return []
 
 
-def _load_tw_cache() -> _TwFundCache:
-    global _cache
-    now = time.monotonic()
-    if _cache is not None and (now - _cache.loaded_at) < _CACHE_TTL:
-        return _cache
+def _fetch_parallel(urls: dict[str, str], budget: float | None = None) -> tuple[dict[str, list[dict]], bool]:
+    """Fetch endpoints concurrently within a hard wall-clock budget."""
+    limit = _FETCH_BUDGET_SECONDS if budget is None else budget
+    pool = ThreadPoolExecutor(max_workers=len(urls))
+    futs = {pool.submit(_fetch_list, u): k for k, u in urls.items()}
+    done, not_done = wait(futs.keys(), timeout=limit)
+    raw: dict[str, list[dict]] = {k: [] for k in urls}
+    for f in done:
+        raw[futs[f]] = f.result()
+    if not_done:
+        slow = [futs[f] for f in not_done]
+        log.warning("Fundamentals endpoints exceeded %.1fs budget: %s", limit, slow)
+    pool.shutdown(wait=False, cancel_futures=True)
+    is_complete = (not not_done) and all(bool(raw[k]) for k in urls)
+    return raw, is_complete
 
-    with _lock:
-        now = time.monotonic()
-        if _cache is not None and (now - _cache.loaded_at) < _CACHE_TTL:
-            return _cache
 
-        urls = {
-            "twse_val": "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
-            "tpex_val": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
-            "twse_rev": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
-            "tpex_rev": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
-            "twse_mgn": "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN",
-            "tpex_mgn": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance",
-        }
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futs = {k: pool.submit(_fetch_list, u) for k, u in urls.items()}
-            raw = {k: f.result() for k, f in futs.items()}
+def _parse_market(market: str, raw: dict[str, list[dict]], is_complete: bool) -> _TwFundCache:
+    val_map: dict[str, Valuation] = {}
+    rev_map: dict[str, MonthlyRevenue] = {}
+    mgn_map: dict[str, MarginInfo] = {}
 
-        val_map: dict[str, Valuation] = {}
-        for row in raw["twse_val"]:
+    if market == "TWSE":
+        for row in raw["val"]:
             code = str(row.get("Code", "")).strip().upper()
             if code:
                 val_map[code] = Valuation(
@@ -141,32 +169,7 @@ def _load_tw_cache() -> _TwFundCache:
                     pb=_fnum(row.get("PBratio")),
                     yield_pct=_fnum(row.get("DividendYield")),
                 )
-        for row in raw["tpex_val"]:
-            code = str(row.get("SecuritiesCompanyCode", "")).strip().upper()
-            if code and code not in val_map:
-                val_map[code] = Valuation(
-                    pe=_fnum(row.get("PriceEarningRatio")),
-                    pb=_fnum(row.get("PriceBookRatio")),
-                    yield_pct=_fnum(row.get("YieldRatio")),
-                )
-
-        rev_map: dict[str, MonthlyRevenue] = {}
-        for src in (raw["twse_rev"], raw["tpex_rev"]):
-            for row in src:
-                code = str(row.get("公司代號", "")).strip().upper()
-                if not code or code in rev_map:
-                    continue
-                rev_k = _fnum(row.get("營業收入-當月營收"))
-                rev_map[code] = MonthlyRevenue(
-                    period=_roc_ym(row.get("資料年月", "")),
-                    revenue_yi=(rev_k / 100_000.0) if rev_k is not None else None,
-                    mom_pct=_fnum(row.get("營業收入-上月比較增減(%)")),
-                    yoy_pct=_fnum(row.get("營業收入-去年同月增減(%)")),
-                    cum_yoy_pct=_fnum(row.get("累計營業收入-前期比較增減(%)")),
-                )
-
-        mgn_map: dict[str, MarginInfo] = {}
-        for row in raw["twse_mgn"]:
+        for row in raw["mgn"]:
             code = str(row.get("股票代號", "")).strip().upper()
             if not code:
                 continue
@@ -180,9 +183,18 @@ def _load_tw_cache() -> _TwFundCache:
                 short_change=(s_cur - s_prev) if (s_cur is not None and s_prev is not None) else None,
                 short_ratio_pct=ratio,
             )
-        for row in raw["tpex_mgn"]:
+    else:
+        for row in raw["val"]:
             code = str(row.get("SecuritiesCompanyCode", "")).strip().upper()
-            if not code or code in mgn_map:
+            if code:
+                val_map[code] = Valuation(
+                    pe=_fnum(row.get("PriceEarningRatio")),
+                    pb=_fnum(row.get("PriceBookRatio")),
+                    yield_pct=_fnum(row.get("YieldRatio")),
+                )
+        for row in raw["mgn"]:
+            code = str(row.get("SecuritiesCompanyCode", "")).strip().upper()
+            if not code:
                 continue
             m_cur, m_prev = _fnum(row.get("MarginPurchaseBalance")), _fnum(row.get("MarginPurchaseBalancePreviousDay"))
             s_cur, s_prev = _fnum(row.get("ShortSaleBalance")), _fnum(row.get("ShortSaleBalancePreviousDay"))
@@ -195,19 +207,74 @@ def _load_tw_cache() -> _TwFundCache:
                 short_ratio_pct=ratio,
             )
 
-        if val_map or rev_map or mgn_map:
-            _cache = _TwFundCache(val_map, rev_map, mgn_map, time.monotonic())
-            return _cache
-        if _cache is not None:
-            return _cache
-        return _TwFundCache({}, {}, {}, 0.0)
+    for row in raw["rev"]:
+        code = str(row.get("公司代號", "")).strip().upper()
+        if not code or code in rev_map:
+            continue
+        rev_k = _fnum(row.get("營業收入-當月營收"))
+        rev_map[code] = MonthlyRevenue(
+            period=_roc_ym(row.get("資料年月", "")),
+            revenue_yi=(rev_k / 100_000.0) if rev_k is not None else None,
+            mom_pct=_fnum(row.get("營業收入-上月比較增減(%)")),
+            yoy_pct=_fnum(row.get("營業收入-去年同月增減(%)")),
+            cum_yoy_pct=_fnum(row.get("累計營業收入-前期比較增減(%)")),
+        )
+
+    ttl = _CACHE_TTL if is_complete else _PARTIAL_CACHE_TTL
+    return _TwFundCache(val_map, rev_map, mgn_map, time.monotonic(), ttl=ttl, is_complete=is_complete)
+
+
+def _load_market_cache(market: str) -> _TwFundCache:
+    market = "TPEX" if market == "TPEX" else "TWSE"
+    now = time.monotonic()
+    existing = _caches.get(market)
+    if existing is not None and existing.is_fresh(now):
+        return existing
+
+    lock = _locks[market]
+    if not lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS):
+        raise FundamentalDataBusy(market)
+    try:
+        now = time.monotonic()
+        existing = _caches.get(market)
+        if existing is not None and existing.is_fresh(now):
+            return existing
+
+        urls = _TWSE_URLS if market == "TWSE" else _TPEX_URLS
+        raw, is_complete = _fetch_parallel(urls)
+        parsed = _parse_market(market, raw, is_complete)
+        if parsed.valuation or parsed.revenue or parsed.margin:
+            _caches[market] = parsed
+            return parsed
+        if existing is not None:
+            return existing
+        return _TwFundCache({}, {}, {}, 0.0, ttl=0.0, is_complete=False)
+    finally:
+        lock.release()
+
+
+def clear_cache() -> None:
+    """Clear all in-memory fundamentals caches (used by tests)."""
+    _caches.clear()
+
+
+def is_cache_complete(code: str) -> bool:
+    """Return True if the cached market containing code was loaded completely."""
+    c_key = code.strip().upper()
+    for cache in _caches.values():
+        if c_key in cache.valuation or c_key in cache.revenue or c_key in cache.margin:
+            return cache.is_complete
+    return True
 
 
 def lookup_valuation(code: str) -> Valuation | None:
     """Quick cached lookup of Taiwan PE/PB/Yield for quote cards."""
-    if _cache is None:
-        return None
-    return _cache.valuation.get(code.strip().upper())
+    c_key = code.strip().upper()
+    for market in ("TWSE", "TPEX"):
+        cache = _caches.get(market)
+        if cache is not None and c_key in cache.valuation:
+            return cache.valuation[c_key]
+    return None
 
 
 def fetch(quote: StockQuote) -> FundamentalReport:
@@ -216,20 +283,27 @@ def fetch(quote: StockQuote) -> FundamentalReport:
         raise FundamentalDataUnavailable(quote.ticker)
 
     if quote.is_taiwan:
-        c = _load_tw_cache()
+        market = "TPEX" if quote.yahoo_symbol.endswith(".TWO") else "TWSE"
+        c = _load_market_cache(market)
         code = quote.ticker.upper()
         val = c.valuation.get(code)
         rev = c.revenue.get(code)
         mgn = c.margin.get(code)
         if not any((val, rev, mgn)):
             raise FundamentalDataUnavailable(quote.ticker)
-        return FundamentalReport(quote=quote, valuation=val, revenue=rev, margin=mgn)
+        return FundamentalReport(
+            quote=quote,
+            valuation=val,
+            revenue=rev,
+            margin=mgn,
+            is_complete=c.is_complete,
+        )
 
     # US stock fundamentals via yfinance .info
     try:
         info = yf.Ticker(quote.yahoo_symbol).info or {}
-    except Exception as err:
-        raise FundamentalDataUnavailable(quote.ticker) from err
+    except Exception:
+        raise FundamentalDataUnavailable(quote.ticker) from None
 
     val = Valuation(
         pe=_fnum(info.get("trailingPE")),
