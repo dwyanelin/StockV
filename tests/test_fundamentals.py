@@ -1,6 +1,7 @@
-"""Unit tests for app.stock.fundamentals (TWSE/TPEx caching and US yfinance fundamentals)."""
+"""Unit tests for app.stock.fundamentals (split TWSE/TPEx caches, budget timeout, partial TTL, US)."""
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,9 +12,9 @@ from app.stock.data import StockQuote
 
 @pytest.fixture(autouse=True)
 def _reset_cache():
-    fundamentals._cache = None
+    fundamentals.clear_cache()
     yield
-    fundamentals._cache = None
+    fundamentals.clear_cache()
 
 
 def test_fnum_and_roc_ym():
@@ -40,14 +41,15 @@ def test_fetch_list_handles_valid_non_list_and_error(monkeypatch):
     assert fundamentals._fetch_list("https://example.test") == []
 
 
-def test_load_tw_cache_parses_twse_and_tpex_and_lookup_valuation(monkeypatch):
+def test_load_twse_and_tpex_caches_separately(monkeypatch):
     assert fundamentals.lookup_valuation("2330") is None
+    assert fundamentals.is_cache_complete("2330") is True
 
+    called_urls: list[str] = []
     payloads = {
         "BWIBBU_ALL": [{"Code": "2330", "PEratio": "25.5", "PBratio": "6.2", "DividendYield": "1.8"}],
         "tpex_mainboard_peratio_analysis": [
             {"SecuritiesCompanyCode": "8069", "PriceEarningRatio": "20.1", "PriceBookRatio": "4.0", "YieldRatio": "3.1"},
-            {"SecuritiesCompanyCode": "2330", "PriceEarningRatio": "99.0"},  # ignored since TWSE exists
         ],
         "t187ap05_L": [
             {
@@ -81,57 +83,103 @@ def test_load_tw_cache_parses_twse_and_tpex_and_lookup_valuation(monkeypatch):
                 "ShortSaleBalance": "100",
                 "ShortSaleBalancePreviousDay": "90",
             },
-            {"SecuritiesCompanyCode": "2330", "MarginPurchaseBalance": "1"},
+            {"SecuritiesCompanyCode": ""},
         ],
     }
 
     def fake_fetch_list(url: str):
+        called_urls.append(url)
         for key, val in payloads.items():
             if key in url:
                 return val
         return []
 
     monkeypatch.setattr(fundamentals, "_fetch_list", fake_fetch_list)
-    cache = fundamentals._load_tw_cache()
-    assert cache.valuation["2330"].pe == 25.5
-    assert cache.valuation["8069"].pe == 20.1
-    assert cache.revenue["2330"].period == "2026/10"
-    assert cache.revenue["2330"].revenue_yi == pytest.approx(3000.0)
-    assert cache.margin["2330"].margin_change == 500.0
-    assert cache.margin["2330"].short_ratio_pct == pytest.approx(5.0)
-    assert cache.margin["8069"].margin_change == -100.0
+
+    # Loading TWSE only calls TWSE endpoints (never TPEx)
+    twse = fundamentals._load_market_cache("TWSE")
+    assert all("twse.com.tw" in u for u in called_urls)
+    assert twse.is_complete is True
+    assert twse.ttl == fundamentals._CACHE_TTL
+    assert twse.valuation["2330"].pe == 25.5
+    assert twse.revenue["2330"].period == "2026/10"
+    assert twse.revenue["2330"].revenue_yi == pytest.approx(3000.0)
+    assert twse.margin["2330"].margin_change == 500.0
+    assert twse.margin["2330"].short_ratio_pct == pytest.approx(5.0)
+    assert fundamentals.lookup_valuation(" 2330 ").pb == 6.2
+    assert fundamentals.is_cache_complete("2330") is True
 
     # Cache hit
-    assert fundamentals._load_tw_cache() is cache
-    assert fundamentals.lookup_valuation(" 2330 ").pb == 6.2
+    assert fundamentals._load_market_cache("TWSE") is twse
 
-    # Expire cache + empty upstream -> falls back to stale cache
-    fundamentals._cache.loaded_at = -999999.0
+    # Loading TPEx independently
+    called_urls.clear()
+    tpex = fundamentals._load_market_cache("TPEX")
+    assert all("tpex.org.tw" in u for u in called_urls)
+    assert tpex.is_complete is True
+    assert tpex.valuation["8069"].pe == 20.1
+    assert tpex.margin["8069"].margin_change == -100.0
+    assert fundamentals.lookup_valuation("8069").yield_pct == 3.1
+
+    # Expire TWSE cache + empty upstream -> falls back to stale cache
+    fundamentals._caches["TWSE"].loaded_at = -999999.0
     monkeypatch.setattr(fundamentals, "_fetch_list", lambda url: [])
-    assert fundamentals._load_tw_cache() is cache
+    assert fundamentals._load_market_cache("TWSE") is twse
 
     # No cache + empty upstream -> empty cache
-    fundamentals._cache = None
-    empty_cache = fundamentals._load_tw_cache()
+    fundamentals.clear_cache()
+    empty_cache = fundamentals._load_market_cache("TWSE")
     assert empty_cache.valuation == {}
+    assert empty_cache.is_complete is False
+
+
+def test_partial_timeout_uses_short_ttl_and_marks_incomplete(monkeypatch):
+    def fake_fetch(url: str):
+        if "MI_MARGN" in url:
+            time.sleep(0.3)
+            return [{"股票代號": "2330"}]
+        if "BWIBBU_ALL" in url:
+            return [{"Code": "2330", "PEratio": "20.0", "PBratio": "5.0", "DividendYield": "2.0"}]
+        return [{"公司代號": "2330", "資料年月": "11510", "營業收入-當月營收": "100,000"}]
+
+    monkeypatch.setattr(fundamentals, "_fetch_list", fake_fetch)
+    monkeypatch.setattr(fundamentals, "_FETCH_BUDGET_SECONDS", 0.05)
+
+    c = fundamentals._load_market_cache("TWSE")
+    assert c.is_complete is False
+    assert c.ttl == fundamentals._PARTIAL_CACHE_TTL
+    assert c.valuation["2330"].pe == 20.0
+    assert "2330" not in c.margin
+    assert fundamentals.is_cache_complete("2330") is False
+
+
+def test_lock_timeout_raises_busy(monkeypatch):
+    monkeypatch.setattr(fundamentals, "_LOCK_TIMEOUT_SECONDS", 0.01)
+    lock = fundamentals._locks["TWSE"]
+    lock.acquire()
+    try:
+        with pytest.raises(fundamentals.FundamentalDataBusy):
+            fundamentals._load_market_cache("TWSE")
+    finally:
+        lock.release()
 
 
 def test_fetch_taiwan_us_and_errors(monkeypatch):
-    # Non-stock raises
     idx_q = StockQuote("台股", "^TWII", "加權指數", True, "TWD", "index")
     with pytest.raises(fundamentals.FundamentalDataUnavailable):
         fundamentals.fetch(idx_q)
 
-    # Taiwan stock found
+    # Taiwan listed stock found
     tw_q = StockQuote("2330", "2330.TW", "台積電", True, "TWD", "stock")
-    fundamentals._cache = fundamentals._TwFundCache(
+    fundamentals._caches["TWSE"] = fundamentals._TwFundCache(
         valuation={"2330": fundamentals.Valuation(pe=20.0, pb=5.0, yield_pct=2.0)},
         revenue={},
         margin={},
-        loaded_at=1e12,
+        loaded_at=time.monotonic() + 1000,
     )
     rep_tw = fundamentals.fetch(tw_q)
     assert rep_tw.valuation.pe == 20.0
+    assert rep_tw.is_complete is True
 
     # Taiwan stock missing
     tw_missing = StockQuote("9999", "9999.TW", "無資料", True, "TWD", "stock")

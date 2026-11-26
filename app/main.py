@@ -255,7 +255,9 @@ def _execute_and_reply(event, kind: str, query: str, is_group: bool) -> None:
     try:
         _cleanup_charts()
         messages = _handle_command(kind, query)
-        response_cache.set(kind, target_key, messages)
+        # Skip 600s response cache when a fundamentals load was only partial
+        if kind != "F" or fundamentals.is_cache_complete(target_key):
+            response_cache.set(kind, target_key, messages)
     except data.StockNotFoundError:
         rate_limiter.release_group_slot(group_id, kind, target_key)
         if is_group and _HAS_CJK.search(query):
@@ -270,6 +272,10 @@ def _execute_and_reply(event, kind: str, query: str, is_group: bool) -> None:
         rate_limiter.release_group_slot(group_id, kind, target_key)
         messages = [TextMessage(
             text=f"❓ 查不到「{query}」的歷史配息資料。")]
+    except fundamentals.FundamentalDataBusy:
+        rate_limiter.release_group_slot(group_id, kind, target_key)
+        messages = [TextMessage(
+            text="⚠️ 基本面資料源忙碌中，請稍後再試一次。")]
     except fundamentals.FundamentalDataUnavailable:
         rate_limiter.release_group_slot(group_id, kind, target_key)
         messages = [TextMessage(
