@@ -302,7 +302,14 @@ def quote_card(snap: QuickSnapshot, valuation: Valuation | None = None) -> FlexM
     arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "─")
     sign = "+" if chg > 0 else ""
 
-    type_labels = {"stock": "即時報價", "index": "指數報價", "crypto": "加密貨幣", "fx": "外匯報價", "commodity": "商品期貨"}
+    type_labels = {
+        "stock": "即時報價",
+        "index": "指數報價",
+        "futures": "期貨報價",
+        "crypto": "加密貨幣",
+        "fx": "外匯報價",
+        "commodity": "商品期貨",
+    }
     badge = type_labels.get(q.asset_type, "即時報價")
 
     body: list[dict] = [

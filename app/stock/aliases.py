@@ -18,8 +18,14 @@ class AssetAlias:
 _MARKET_TW = AssetAlias("台股", "^TWII", "台灣加權指數", True, "TWD", "index")
 
 _ENTRIES: list[tuple[tuple[str, ...], AssetAlias]] = [
-    # Taiwan Market Index
+    # Taiwan Market Index & Futures (TAIFEX)
     (("台股", "臺股", "大盤", "加權", "加權指數", "TSE", "TWII", "TAIEX"), _MARKET_TW),
+    (("台指期", "臺指期", "大台", "大臺", "TXF", "台指"), AssetAlias("台指期", "TAIFEX:TXF", "台指期", True, "TWD", "futures")),
+    (("小台", "小臺", "小台指", "小臺指", "MXF", "MTX"), AssetAlias("小台", "TAIFEX:MXF", "小台指", True, "TWD", "futures")),
+    # US Index Futures
+    (("小那", "那指期", "納指期", "NQ", "NQ=F"), AssetAlias("NQ", "NQ=F", "那斯達克期貨", False, "USD", "futures")),
+    (("小標普", "標普期", "ES", "ES=F"), AssetAlias("ES", "ES=F", "S&P 500 期貨", False, "USD", "futures")),
+    (("小道", "小道瓊", "道瓊期", "YM", "YM=F"), AssetAlias("YM", "YM=F", "道瓊期貨", False, "USD", "futures")),
     # Global Indices
     (("SP500", "S&P500", "SPX", "標普", "標普500"), AssetAlias("SP500", "^GSPC", "S&P 500 指數", False, "USD", "index")),
     (("NASDAQ", "IXIC", "那斯達克", "那指", "納斯達克", "納指"), AssetAlias("NASDAQ", "^IXIC", "那斯達克指數", False, "USD", "index")),
