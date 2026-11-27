@@ -16,7 +16,7 @@ import mplfinance as mpf
 import pandas as pd
 from matplotlib.ticker import FuncFormatter
 
-from app.stock.data import DividendReport, StockQuote
+from app.stock.data import DividendReport, StockQuote, intraday_total_volume
 from app.stock.institutional import InstReport
 
 BG = "#0f141e"
@@ -153,7 +153,8 @@ def intraday_chart(
     open_px = float(df["Open"].dropna().iloc[0]) if "Open" in df.columns and not df["Open"].dropna().empty else float(close.iloc[0])
     high_px = float(df["High"].dropna().max()) if "High" in df.columns and not df["High"].dropna().empty else float(close.max())
     low_px = float(df["Low"].dropna().min()) if "Low" in df.columns and not df["Low"].dropna().empty else float(close.min())
-    total_vol = float(df["Volume"].dropna().sum()) if "Volume" in df.columns else 0.0
+    bar_vol_sum = float(df["Volume"].dropna().sum()) if "Volume" in df.columns else 0.0
+    total_vol = intraday_total_volume(df)
 
     ref = prev_close if prev_close else open_px
     change = last - ref
@@ -163,7 +164,7 @@ def intraday_chart(
     arrow = "▲" if change > 0 else ("▼" if change < 0 else "─")
     sign = "+" if change > 0 else ""
 
-    has_vol = "Volume" in df.columns and total_vol > 0
+    has_vol = "Volume" in df.columns and bar_vol_sum > 0
     if has_vol:
         fig, (ax, ax_vol) = plt.subplots(
             2, 1, figsize=(10, 6.25), dpi=150, sharex=True,

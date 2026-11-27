@@ -135,11 +135,30 @@ def test_backfill_latest_bar_edge_cases():
     assert pd.isna(still_nan["Close"].iloc[-1])
 
 
+def test_intraday_total_volume_helper():
+    df = _ohlcv_df(["2026-11-27 09:00", "2026-11-27 13:30"], [5200.0, 5090.0], vols=[973_800.0, 0.0])
+    assert data.intraday_total_volume(df) == 973_800.0
+
+    # Authoritative daily total_volume overrides 1m bar sum
+    df.attrs["total_volume"] = 1_041_767.0
+    assert data.intraday_total_volume(df) == 1_041_767.0
+
+    # Zero or NaN total_volume falls back to bar sum
+    df.attrs["total_volume"] = 0.0
+    assert data.intraday_total_volume(df) == 973_800.0
+    df.attrs["total_volume"] = float("nan")
+    assert data.intraday_total_volume(df) == 973_800.0
+
+    # Missing Volume column returns 0.0
+    no_vol = pd.DataFrame({"Close": [100.0]}, index=pd.to_datetime(["2026-11-27 13:30"]))
+    assert data.intraday_total_volume(no_vol) == 0.0
+
+
 def test_intraday_primary_fallback_and_prev_close(monkeypatch):
     q = _tw_quote()
-    # 1m empty -> 5m empty -> 15m has 2 days (should filter to last day)
-    df_15m = _ohlcv_df(["2026-11-19 13:00", "2026-11-20 09:00", "2026-11-20 09:15"], [990.0, 1000.0, 1010.0])
-    df_daily = _ohlcv_df(["2026-11-19", "2026-11-20"], [995.0, 1010.0])
+    # 1m empty -> 5m empty -> 15m has 2 days (should filter to last day, passing prepost=True for TW)
+    df_15m = _ohlcv_df(["2026-11-19 13:00", "2026-11-20 09:00", "2026-11-20 13:30"], [990.0, 1000.0, 1010.0])
+    df_daily = _ohlcv_df(["2026-11-19", "2026-11-20"], [995.0, 1010.0], vols=[500_000.0, 1_041_767.0])
 
     tk = MagicMock()
     tk.history.side_effect = [pd.DataFrame(), pd.DataFrame(), df_15m, df_daily]
@@ -148,16 +167,48 @@ def test_intraday_primary_fallback_and_prev_close(monkeypatch):
     res_df, prev = data.intraday(q)
     assert len(res_df) == 2
     assert prev == 995.0
+    assert res_df.attrs["total_volume"] == 1_041_767.0
+    # Verify prepost=True on all intraday interval requests for Taiwan stocks
+    assert tk.history.call_args_list[0].kwargs == {"period": "1d", "interval": "1m", "prepost": True}
+    assert tk.history.call_args_list[1].kwargs == {"period": "5d", "interval": "5m", "prepost": True}
+    assert tk.history.call_args_list[2].kwargs == {"period": "5d", "interval": "15m", "prepost": True}
 
-    # Daily latest date differs from intraday -> uses daily[-1]
+    # Global cash index also uses prepost=True; daily Volume=0 does not set total_volume
+    q_idx = data.StockQuote("SP500", "^GSPC", "S&P 500 指數", False, "USD", "index")
+    tk_idx = MagicMock()
+    tk_idx.history.side_effect = [
+        _ohlcv_df(["2026-11-20 09:30", "2026-11-20 16:00"], [5900.0, 5950.0], vols=[0.0, 0.0]),
+        _ohlcv_df(["2026-11-20"], [5950.0], vols=[0.0]),  # single same-day row -> prev_close stays None
+    ]
+    monkeypatch.setattr(data.yf, "Ticker", lambda sym: tk_idx)
+    idx_df, idx_prev = data.intraday(q_idx)
+    assert idx_prev is None
+    assert "total_volume" not in idx_df.attrs
+    assert tk_idx.history.call_args_list[0].kwargs == {"period": "1d", "interval": "1m", "prepost": True}
+
+    # US equity keeps prepost=False to avoid mixing extended-hours bars into regular session
+    q_us = _us_quote()
+    tk_us = MagicMock()
+    tk_us.history.side_effect = [
+        _ohlcv_df(["2026-11-20 09:30", "2026-11-20 15:59"], [220.0, 225.0], vols=[100.0, 200.0]),
+        _ohlcv_df(["2026-11-19", "2026-11-20"], [218.0, 225.0], vols=[1000.0, 54_000_000.0]),
+    ]
+    monkeypatch.setattr(data.yf, "Ticker", lambda sym: tk_us)
+    us_df, us_prev = data.intraday(q_us)
+    assert us_prev == 218.0
+    assert us_df.attrs["total_volume"] == 54_000_000.0
+    assert tk_us.history.call_args_list[0].kwargs == {"period": "1d", "interval": "1m", "prepost": False}
+
+    # Daily latest date differs from intraday -> uses daily[-1] and does not attach total_volume
     tk2 = MagicMock()
     tk2.history.side_effect = [
         _ohlcv_df(["2026-11-20 09:00"], [1000.0]),
         _ohlcv_df(["2026-11-19"], [980.0]),
     ]
     monkeypatch.setattr(data.yf, "Ticker", lambda sym: tk2)
-    _, prev2 = data.intraday(q)
+    df2, prev2 = data.intraday(q)
     assert prev2 == 980.0
+    assert "total_volume" not in df2.attrs
 
     # Prev close lookup raises -> returns None gracefully
     tk3 = MagicMock()
