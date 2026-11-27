@@ -22,7 +22,7 @@ from linebot.v3.messaging import (
     QuickReplyItem,
 )
 
-from app.stock.data import DividendReport, QuickSnapshot, StockQuote
+from app.stock.data import DividendReport, QuickSnapshot, StockQuote, intraday_total_volume
 from app.stock.fundamentals import FundamentalReport, Valuation
 from app.stock.institutional import InstReport
 
@@ -365,7 +365,7 @@ def intraday_card(
     open_px = float(df["Open"].dropna().iloc[0]) if "Open" in df.columns and not df["Open"].dropna().empty else float(close.iloc[0])
     high_px = float(df["High"].dropna().max()) if "High" in df.columns and not df["High"].dropna().empty else float(close.max())
     low_px = float(df["Low"].dropna().min()) if "Low" in df.columns and not df["Low"].dropna().empty else float(close.min())
-    total_vol = float(df["Volume"].dropna().sum()) if "Volume" in df.columns else 0.0
+    total_vol = intraday_total_volume(df)
 
     ref = prev_close if prev_close else open_px
     chg = last - ref

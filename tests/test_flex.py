@@ -103,8 +103,10 @@ def test_quote_card_with_and_without_valuation():
 
 def test_intraday_and_candlestick_cards():
     df = _ohlcv_df(n=65, base=100.0)
+    df.attrs["total_volume"] = 1_041_767.0
     p_msg = flex.intraday_card(_tw_quote(), df, 99.0, "https://example.test/p.png")
     assert "台積電" in p_msg.alt_text
+    assert "1,042張" in str(p_msg.contents.to_dict())
 
     k_msg = flex.candlestick_card(_tw_quote(), df, "https://example.test/k.png", timeframe="W")
     assert "週K" in k_msg.alt_text

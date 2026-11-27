@@ -189,6 +189,14 @@ def _backfill_latest_bar(tk: yf.Ticker, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def intraday_total_volume(df: pd.DataFrame) -> float:
+    """Return authoritative daily volume when attached to df.attrs, else sum of bar volumes."""
+    attr_vol = df.attrs.get("total_volume")
+    if attr_vol is not None and not _is_missing(attr_vol) and float(attr_vol) > 0:
+        return float(attr_vol)
+    return float(df["Volume"].dropna().sum()) if "Volume" in df.columns else 0.0
+
+
 def intraday(quote: StockQuote) -> tuple[pd.DataFrame, float | None]:
     """1-minute (or 5-minute fallback) bars for the most recent trading day, plus previous close."""
     if quote.yahoo_symbol.startswith("TAIFEX:"):
@@ -200,22 +208,34 @@ def intraday(quote: StockQuote) -> tuple[pd.DataFrame, float | None]:
         quote.name = qinfo["name"]
         return df, prev_close
 
+    # Taiwan equities & cash indices have no extended-hours session on Yahoo Finance,
+    # yet their official closing-auction / close bar sits at the exact market-close
+    # timestamp (e.g. 13:30:00 CST for TWSE/TPEx/^TWII). yfinance's default prepost=False
+    # filters out `index >= tradingPeriods.end`, which drops the 13:30 closing bar and
+    # freezes Taiwan intraday prices at 13:24 (before the 5-min closing call auction).
+    include_close = quote.is_taiwan or quote.asset_type == "index"
+
     tk = yf.Ticker(quote.yahoo_symbol)
-    df = tk.history(period="1d", interval="1m")
+    df = tk.history(period="1d", interval="1m", prepost=include_close)
     if df.empty:
-        df = tk.history(period="5d", interval="5m")
+        df = tk.history(period="5d", interval="5m", prepost=include_close)
         if df.empty:
-            df = tk.history(period="5d", interval="15m")
+            df = tk.history(period="5d", interval="15m", prepost=include_close)
         if df.empty:
             raise StockNotFoundError(quote.ticker)
-        last_day = df.index[-1].date()
-        df = df[df.index.date == last_day]
+    last_day = df.index[-1].date()
+    df = df[df.index.date == last_day].copy()
 
     prev_close = None
     try:
         daily = tk.history(period="10d", interval="1d").dropna(subset=["Close"])
-        if len(daily) >= 2 and daily.index[-1].date() == df.index[-1].date():
-            prev_close = float(daily["Close"].iloc[-2])
+        if not daily.empty and daily.index[-1].date() == last_day:
+            if len(daily) >= 2:
+                prev_close = float(daily["Close"].iloc[-2])
+            if "Volume" in daily.columns and not _is_missing(daily["Volume"].iloc[-1]):
+                day_vol = float(daily["Volume"].iloc[-1])
+                if day_vol > 0:
+                    df.attrs["total_volume"] = day_vol
         elif not daily.empty:
             prev_close = float(daily["Close"].iloc[-1])
     except Exception:
