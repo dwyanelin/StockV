@@ -2,9 +2,11 @@
 
 - Taiwan stocks (TWSE / TPEx fetched independently): cached OpenAPI snapshots
   for PE/PB/Yield, monthly revenue (MoM / YoY / cumulative YoY), and margin/short
-  balances. Strict 6-second wall-clock budget + partial-aware cache TTL prevent
-  stalled upstream endpoints from blocking LINE webhook replies.
-- US stocks: Yahoo Finance .info fundamentals snapshot.
+  balances, enriched in parallel with Yahoo Finance TTM ROE, EV/EBITDA, and
+  market cap (3.5s hard timeout + 6h per-symbol cache + graceful degradation).
+- US stocks: Yahoo Finance .info fundamentals snapshot (incl. ROE & EV/EBITDA).
+- Financial Services sector guard: EV/EBITDA is intentionally suppressed for
+  banks/financials where EBITDA is not a meaningful valuation metric.
 """
 from __future__ import annotations
 
@@ -26,6 +28,8 @@ _CACHE_TTL = 6 * 3600.0
 _PARTIAL_CACHE_TTL = 30.0
 _FETCH_BUDGET_SECONDS = 6.0
 _LOCK_TIMEOUT_SECONDS = 6.0
+_YF_INFO_BUDGET_SECONDS = 3.5
+_YF_CACHE_MAX_ENTRIES = 500
 
 _TWSE_URLS = {
     "val": "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
@@ -79,8 +83,12 @@ class FundamentalReport:
     revenue: MonthlyRevenue | None = None
     margin: MarginInfo | None = None
     is_complete: bool = True
-    # US-specific extras
+    # Quality & enterprise valuation (TW + US)
+    roe_pct: float | None = None
+    ev_ebitda: float | None = None
+    is_financial: bool = False
     market_cap: float | None = None
+    # US-specific extras
     forward_pe: float | None = None
     rev_growth_pct: float | None = None
     profit_margin_pct: float | None = None
@@ -101,11 +109,23 @@ class _TwFundCache:
         return (now - self.loaded_at) < self.ttl
 
 
+@dataclass
+class _YfMetrics:
+    roe_pct: float | None
+    ev_ebitda: float | None
+    market_cap: float | None
+    is_financial: bool
+    loaded_at: float
+
+
 _locks: dict[str, threading.Lock] = {
     "TWSE": threading.Lock(),
     "TPEX": threading.Lock(),
 }
 _caches: dict[str, _TwFundCache] = {}
+_yf_lock = threading.Lock()
+_yf_cache: dict[str, _YfMetrics] = {}
+_yf_incomplete_codes: set[str] = set()
 
 
 def _fnum(s) -> float | None:
@@ -125,6 +145,64 @@ def _roc_ym(raw: str) -> str:
     if len(s) == 5 and s.isdigit():
         return f"{int(s[:3]) + 1911}/{s[3:]}"
     return s
+
+
+def _extract_yf_quality(info: dict) -> tuple[float | None, float | None, float | None, bool]:
+    """Extract (roe_pct, ev_ebitda, market_cap, is_financial) from yfinance .info."""
+    sector = str(info.get("sector") or "").strip()
+    is_financial = sector == "Financial Services"
+    raw_roe = _fnum(info.get("returnOnEquity"))
+    roe_pct = (raw_roe * 100.0) if raw_roe is not None else None
+    ev_ebitda = None if is_financial else _fnum(info.get("enterpriseToEbitda"))
+    market_cap = _fnum(info.get("marketCap"))
+    return roe_pct, ev_ebitda, market_cap, is_financial
+
+
+def _get_yf_info(yahoo_symbol: str) -> dict:
+    return yf.Ticker(yahoo_symbol).info or {}
+
+
+def _fetch_yf_metrics(yahoo_symbol: str, budget: float | None = None) -> tuple[_YfMetrics | None, bool]:
+    """Fetch per-symbol ROE / EV/EBITDA / market cap with 3.5s budget and 6h cache."""
+    now = time.monotonic()
+    with _yf_lock:
+        cached = _yf_cache.get(yahoo_symbol)
+        if cached is not None and (now - cached.loaded_at) < _CACHE_TTL:
+            return cached, True
+
+    limit = _YF_INFO_BUDGET_SECONDS if budget is None else budget
+    pool = ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(_get_yf_info, yahoo_symbol)
+    done, _ = wait({fut}, timeout=limit)
+    pool.shutdown(wait=False, cancel_futures=True)
+
+    if not done:
+        log.warning("Yahoo .info exceeded %.1fs budget for %s", limit, yahoo_symbol)
+        return None, False
+
+    try:
+        info = fut.result()
+    except Exception:
+        log.warning("Yahoo .info failed for %s", yahoo_symbol, exc_info=True)
+        return None, False
+
+    if not info:
+        return None, False
+
+    roe_pct, ev_ebitda, market_cap, is_financial = _extract_yf_quality(info)
+    metrics = _YfMetrics(
+        roe_pct=roe_pct,
+        ev_ebitda=ev_ebitda,
+        market_cap=market_cap,
+        is_financial=is_financial,
+        loaded_at=time.monotonic(),
+    )
+    with _yf_lock:
+        _yf_cache[yahoo_symbol] = metrics
+        if len(_yf_cache) > _YF_CACHE_MAX_ENTRIES:
+            oldest = min(_yf_cache.items(), key=lambda kv: kv[1].loaded_at)[0]
+            _yf_cache.pop(oldest, None)
+    return metrics, True
 
 
 def _fetch_list(url: str) -> list[dict]:
@@ -256,11 +334,17 @@ def _load_market_cache(market: str) -> _TwFundCache:
 def clear_cache() -> None:
     """Clear all in-memory fundamentals caches (used by tests)."""
     _caches.clear()
+    with _yf_lock:
+        _yf_cache.clear()
+        _yf_incomplete_codes.clear()
 
 
 def is_cache_complete(code: str) -> bool:
-    """Return True if the cached market containing code was loaded completely."""
+    """Return True if both market cache and per-symbol Yahoo metrics are complete."""
     c_key = code.strip().upper()
+    with _yf_lock:
+        if c_key in _yf_incomplete_codes:
+            return False
     for cache in _caches.values():
         if c_key in cache.valuation or c_key in cache.revenue or c_key in cache.margin:
             return cache.is_complete
@@ -284,24 +368,41 @@ def fetch(quote: StockQuote) -> FundamentalReport:
 
     if quote.is_taiwan:
         market = "TPEX" if quote.yahoo_symbol.endswith(".TWO") else "TWSE"
-        c = _load_market_cache(market)
         code = quote.ticker.upper()
+
+        # Fetch TWSE/TPEx market tables and Yahoo .info (ROE / EV/EBITDA) in parallel
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            mkt_fut = pool.submit(_load_market_cache, market)
+            yf_fut = pool.submit(_fetch_yf_metrics, quote.yahoo_symbol)
+            c = mkt_fut.result()
+            yf_metrics, yf_ok = yf_fut.result()
+
+        with _yf_lock:
+            if yf_ok:
+                _yf_incomplete_codes.discard(code)
+            else:
+                _yf_incomplete_codes.add(code)
+
         val = c.valuation.get(code)
         rev = c.revenue.get(code)
         mgn = c.margin.get(code)
-        if not any((val, rev, mgn)):
+        if not any((val, rev, mgn, yf_metrics)):
             raise FundamentalDataUnavailable(quote.ticker)
         return FundamentalReport(
             quote=quote,
             valuation=val,
             revenue=rev,
             margin=mgn,
-            is_complete=c.is_complete,
+            is_complete=(c.is_complete and yf_ok),
+            roe_pct=yf_metrics.roe_pct if yf_metrics else None,
+            ev_ebitda=yf_metrics.ev_ebitda if yf_metrics else None,
+            is_financial=yf_metrics.is_financial if yf_metrics else False,
+            market_cap=yf_metrics.market_cap if yf_metrics else None,
         )
 
-    # US stock fundamentals via yfinance .info
+    # US stock fundamentals via yfinance .info (zero extra roundtrips)
     try:
-        info = yf.Ticker(quote.yahoo_symbol).info or {}
+        info = _get_yf_info(quote.yahoo_symbol)
     except Exception:
         raise FundamentalDataUnavailable(quote.ticker) from None
 
@@ -314,12 +415,16 @@ def fetch(quote: StockQuote) -> FundamentalReport:
             else (float(info["dividendYield"]) * 100.0 if info.get("dividendYield") else None)
         ),
     )
+    roe_pct, ev_ebitda, market_cap, is_financial = _extract_yf_quality(info)
     rev_g = info.get("revenueGrowth")
     pm = info.get("profitMargins")
     report = FundamentalReport(
         quote=quote,
         valuation=val,
-        market_cap=_fnum(info.get("marketCap")),
+        roe_pct=roe_pct,
+        ev_ebitda=ev_ebitda,
+        is_financial=is_financial,
+        market_cap=market_cap,
         forward_pe=_fnum(info.get("forwardPE")),
         rev_growth_pct=(float(rev_g) * 100.0) if rev_g is not None else None,
         profit_margin_pct=(float(pm) * 100.0) if pm is not None else None,

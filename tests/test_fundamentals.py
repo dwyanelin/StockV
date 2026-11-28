@@ -164,12 +164,79 @@ def test_lock_timeout_raises_busy(monkeypatch):
         lock.release()
 
 
+def test_yf_quality_metrics_cache_timeout_and_financial_guard(monkeypatch):
+    # Normal stock extraction
+    roe, ev, mcap, is_fin = fundamentals._extract_yf_quality(
+        {
+            "sector": "Technology",
+            "returnOnEquity": 0.4186,
+            "enterpriseToEbitda": 14.896,
+            "marketCap": 53e12,
+        }
+    )
+    assert roe == pytest.approx(41.86)
+    assert ev == pytest.approx(14.896)
+    assert mcap == pytest.approx(53e12)
+    assert is_fin is False
+
+    # Financial Services sector suppresses EV/EBITDA
+    roe_f, ev_f, _, is_fin_f = fundamentals._extract_yf_quality(
+        {
+            "sector": "Financial Services",
+            "returnOnEquity": 0.26,
+            "enterpriseToEbitda": 5.2,
+            "marketCap": 1.5e12,
+        }
+    )
+    assert roe_f == pytest.approx(26.0)
+    assert ev_f is None
+    assert is_fin_f is True
+
+    # Fetch + 6h cache hit + eviction
+    calls = {"n": 0}
+
+    def fake_info(sym: str):
+        calls["n"] += 1
+        return {"sector": "Technology", "returnOnEquity": 0.25, "enterpriseToEbitda": 12.0, "marketCap": 1e11}
+
+    monkeypatch.setattr(fundamentals, "_get_yf_info", fake_info)
+    monkeypatch.setattr(fundamentals, "_YF_CACHE_MAX_ENTRIES", 1)
+    m1, ok1 = fundamentals._fetch_yf_metrics("2330.TW")
+    assert ok1 is True and m1.roe_pct == pytest.approx(25.0)
+    m1_cached, ok1_cached = fundamentals._fetch_yf_metrics("2330.TW")
+    assert ok1_cached is True and m1_cached is m1 and calls["n"] == 1
+    # Adding a second symbol evicts oldest
+    m2, ok2 = fundamentals._fetch_yf_metrics("3406.TW")
+    assert ok2 is True and m2 is not None and "2330.TW" not in fundamentals._yf_cache
+
+    # Timeout degrades gracefully
+    fundamentals.clear_cache()
+
+    def slow_info(sym: str):
+        time.sleep(0.25)
+        return {"returnOnEquity": 0.1}
+
+    monkeypatch.setattr(fundamentals, "_get_yf_info", slow_info)
+    m_to, ok_to = fundamentals._fetch_yf_metrics("2330.TW", budget=0.03)
+    assert m_to is None and ok_to is False
+
+    # Exception degrades gracefully
+    monkeypatch.setattr(fundamentals, "_get_yf_info", MagicMock(side_effect=RuntimeError("429")))
+    m_err, ok_err = fundamentals._fetch_yf_metrics("2330.TW")
+    assert m_err is None and ok_err is False
+
+    # Empty dict degrades gracefully
+    monkeypatch.setattr(fundamentals, "_get_yf_info", lambda sym: {})
+    m_empty, ok_empty = fundamentals._fetch_yf_metrics("2330.TW")
+    assert m_empty is None and ok_empty is False
+
+
 def test_fetch_taiwan_us_and_errors(monkeypatch):
     idx_q = StockQuote("台股", "^TWII", "加權指數", True, "TWD", "index")
     with pytest.raises(fundamentals.FundamentalDataUnavailable):
         fundamentals.fetch(idx_q)
 
-    # Taiwan listed stock found
+    # Taiwan listed stock found + Yahoo .info ROE/EV/EBITDA enriched in parallel
     tw_q = StockQuote("2330", "2330.TW", "台積電", True, "TWD", "stock")
     fundamentals._caches["TWSE"] = fundamentals._TwFundCache(
         valuation={"2330": fundamentals.Valuation(pe=20.0, pb=5.0, yield_pct=2.0)},
@@ -177,45 +244,76 @@ def test_fetch_taiwan_us_and_errors(monkeypatch):
         margin={},
         loaded_at=time.monotonic() + 1000,
     )
+    monkeypatch.setattr(
+        fundamentals,
+        "_get_yf_info",
+        lambda sym: {"sector": "Technology", "returnOnEquity": 0.42, "enterpriseToEbitda": 15.0, "marketCap": 50e12},
+    )
     rep_tw = fundamentals.fetch(tw_q)
     assert rep_tw.valuation.pe == 20.0
+    assert rep_tw.roe_pct == pytest.approx(42.0)
+    assert rep_tw.ev_ebitda == pytest.approx(15.0)
+    assert rep_tw.market_cap == pytest.approx(50e12)
     assert rep_tw.is_complete is True
+    assert fundamentals.is_cache_complete("2330") is True
 
-    # Taiwan stock missing
+    # Taiwan stock when Yahoo .info fails -> graceful degradation + marked incomplete
+    fundamentals.clear_cache()
+    fundamentals._caches["TWSE"] = fundamentals._TwFundCache(
+        valuation={"2330": fundamentals.Valuation(pe=20.0, pb=5.0, yield_pct=2.0)},
+        revenue={},
+        margin={},
+        loaded_at=time.monotonic() + 1000,
+    )
+    monkeypatch.setattr(fundamentals, "_get_yf_info", MagicMock(side_effect=RuntimeError("rate limit")))
+    rep_partial = fundamentals.fetch(tw_q)
+    assert rep_partial.valuation.pe == 20.0
+    assert rep_partial.roe_pct is None
+    assert rep_partial.is_complete is False
+    assert fundamentals.is_cache_complete("2330") is False
+
+    # Taiwan stock missing from both market cache and Yahoo
     tw_missing = StockQuote("9999", "9999.TW", "無資料", True, "TWD", "stock")
     with pytest.raises(fundamentals.FundamentalDataUnavailable):
         fundamentals.fetch(tw_missing)
 
-    # US stock found (dividendYield > 0.5 treated as already %)
+    # US stock found (dividendYield > 0.5 treated as already %, plus ROE & EV/EBITDA)
     us_q = StockQuote("AAPL", "AAPL", "Apple", False, "USD", "stock")
-    tk = MagicMock()
-    tk.info = {
-        "trailingPE": 30.0,
-        "priceToBook": 40.0,
-        "dividendYield": 0.55,
-        "marketCap": 3e12,
-        "forwardPE": 28.0,
-        "revenueGrowth": 0.08,
-        "profitMargins": 0.25,
-        "fiftyTwoWeekHigh": 250.0,
-        "fiftyTwoWeekLow": 170.0,
-    }
-    monkeypatch.setattr(fundamentals.yf, "Ticker", lambda sym: tk)
+    monkeypatch.setattr(
+        fundamentals,
+        "_get_yf_info",
+        lambda sym: {
+            "sector": "Technology",
+            "trailingPE": 30.0,
+            "priceToBook": 40.0,
+            "dividendYield": 0.55,
+            "returnOnEquity": 1.42,
+            "enterpriseToEbitda": 30.6,
+            "marketCap": 3e12,
+            "forwardPE": 28.0,
+            "revenueGrowth": 0.08,
+            "profitMargins": 0.25,
+            "fiftyTwoWeekHigh": 250.0,
+            "fiftyTwoWeekLow": 170.0,
+        },
+    )
     rep_us = fundamentals.fetch(us_q)
     assert rep_us.valuation.yield_pct == pytest.approx(0.55)
+    assert rep_us.roe_pct == pytest.approx(142.0)
+    assert rep_us.ev_ebitda == pytest.approx(30.6)
     assert rep_us.rev_growth_pct == pytest.approx(8.0)
 
     # US stock with decimal dividendYield (<= 0.5 multiplied by 100)
-    tk.info = {"trailingPE": 20.0, "dividendYield": 0.025}
+    monkeypatch.setattr(fundamentals, "_get_yf_info", lambda sym: {"trailingPE": 20.0, "dividendYield": 0.025})
     rep_us2 = fundamentals.fetch(us_q)
     assert rep_us2.valuation.yield_pct == pytest.approx(2.5)
 
     # US stock with empty info raises
-    tk.info = {}
+    monkeypatch.setattr(fundamentals, "_get_yf_info", lambda sym: {})
     with pytest.raises(fundamentals.FundamentalDataUnavailable):
         fundamentals.fetch(us_q)
 
     # US yfinance exception raises
-    monkeypatch.setattr(fundamentals.yf, "Ticker", MagicMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(fundamentals, "_get_yf_info", MagicMock(side_effect=RuntimeError("boom")))
     with pytest.raises(fundamentals.FundamentalDataUnavailable):
         fundamentals.fetch(us_q)
