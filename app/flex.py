@@ -98,9 +98,15 @@ def _fmt_pct(val: float | None) -> str:
     return f"{sign}{val:.2f}%"
 
 
-def _fmt_mcap(val: float | None) -> str:
+def _fmt_mcap(val: float | None, is_taiwan: bool = False) -> str:
     if val is None:
         return "--"
+    if is_taiwan:
+        if val >= 1e12:
+            return f"{val / 1e12:.2f}兆"
+        if val >= 1e8:
+            return f"{val / 1e8:,.0f}億"
+        return f"{val / 1e4:,.0f}萬"
     if val >= 1e12:
         return f"${val / 1e12:.2f}T"
     if val >= 1e9:
@@ -108,6 +114,24 @@ def _fmt_mcap(val: float | None) -> str:
     if val >= 1e6:
         return f"${val / 1e6:.0f}M"
     return f"${val:,.0f}"
+
+
+def _roe_color(roe_pct: float | None) -> str:
+    if roe_pct is None:
+        return _MUTED
+    if roe_pct >= 15.0:
+        return "#2ebd85"
+    if roe_pct < 0.0:
+        return "#f6465d"
+    return _TEXT
+
+
+def _fmt_ev_ebitda(report: FundamentalReport) -> tuple[str, str]:
+    if report.is_financial:
+        return "金融不適用", _MUTED
+    if report.ev_ebitda is None:
+        return "--", _MUTED
+    return f"{report.ev_ebitda:.2f}x", _TEXT
 
 
 def _metric_cell(label: str, value: str, value_color: str = _TEXT) -> dict:
@@ -550,18 +574,44 @@ def fundamental_card(report: FundamentalReport) -> FlexMessage:
     val = report.valuation
     body: list[dict] = [_header_row(q.name, q.ticker, "基本面 / 資券" if q.is_taiwan else "美股基本面")]
 
-    if val is not None:
+    has_val_section = (
+        val is not None
+        or report.roe_pct is not None
+        or report.ev_ebitda is not None
+        or report.market_cap is not None
+        or report.is_financial
+    )
+    if has_val_section:
+        pe_str = f"{val.pe:.2f}" if (val and val.pe) else "--"
+        pb_str = f"{val.pb:.2f}" if (val and val.pb) else "--"
+        yld_str = f"{val.yield_pct:.2f}%" if (val and val.yield_pct) else "--"
+        roe_str = f"{report.roe_pct:.2f}%" if report.roe_pct is not None else "--"
+        ev_str, ev_col = _fmt_ev_ebitda(report)
+        mcap_str = _fmt_mcap(report.market_cap, is_taiwan=q.is_taiwan)
+
         body.append({"type": "separator", "color": _BORDER})
-        body.append({"type": "text", "text": "估值指標", "size": "xs", "weight": "bold", "color": _ACCENT})
+        body.append({"type": "text", "text": "估值與獲利指標", "size": "xs", "weight": "bold", "color": _ACCENT})
         body.append(
             {
                 "type": "box",
                 "layout": "horizontal",
                 "spacing": "sm",
                 "contents": [
-                    _metric_cell("本益比 PE", f"{val.pe:.2f}" if val.pe else "--"),
-                    _metric_cell("淨值比 PB", f"{val.pb:.2f}" if val.pb else "--"),
-                    _metric_cell("殖利率", f"{val.yield_pct:.2f}%" if val.yield_pct else "--", "#2ebd85"),
+                    _metric_cell("本益比 PE", pe_str),
+                    _metric_cell("淨值比 PB", pb_str),
+                    _metric_cell("殖利率", yld_str, "#2ebd85" if (val and val.yield_pct) else _MUTED),
+                ],
+            }
+        )
+        body.append(
+            {
+                "type": "box",
+                "layout": "horizontal",
+                "spacing": "sm",
+                "contents": [
+                    _metric_cell("ROE (TTM)", roe_str, _roe_color(report.roe_pct)),
+                    _metric_cell("EV/EBITDA", ev_str, ev_col),
+                    _metric_cell("總市值", mcap_str),
                 ],
             }
         )
@@ -613,7 +663,6 @@ def fundamental_card(report: FundamentalReport) -> FlexMessage:
                 "layout": "horizontal",
                 "spacing": "sm",
                 "contents": [
-                    _metric_cell("市值", _fmt_mcap(report.market_cap)),
                     _metric_cell("預估 PE", f"{report.forward_pe:.1f}" if report.forward_pe else "--"),
                     _metric_cell("營收成長", _fmt_pct(report.rev_growth_pct), _pct_color(report.rev_growth_pct, False)),
                     _metric_cell("淨利率", _fmt_pct(report.profit_margin_pct)),

@@ -1,6 +1,7 @@
 """Unit tests for app.flex (formatting helpers and LINE Flex Message builders)."""
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pandas as pd
@@ -72,6 +73,14 @@ def test_formatting_helpers():
     assert flex._fmt_mcap(50e9) == "$50.0B"
     assert flex._fmt_mcap(250e6) == "$250M"
     assert flex._fmt_mcap(5000) == "$5,000"
+    assert flex._fmt_mcap(53.6e12, is_taiwan=True) == "53.60兆"
+    assert flex._fmt_mcap(1471e8, is_taiwan=True) == "1,471億"
+    assert flex._fmt_mcap(50e6, is_taiwan=True) == "5,000萬"
+
+    assert flex._roe_color(None) == flex._MUTED
+    assert flex._roe_color(20.0) == "#2ebd85"
+    assert flex._roe_color(8.5) == flex._TEXT
+    assert flex._roe_color(-3.0) == "#f6465d"
 
 
 def test_footer_nav_variants():
@@ -152,13 +161,34 @@ def test_fundamental_fx_overview_and_help_cards():
         valuation=Valuation(pe=25.0, pb=6.0, yield_pct=1.8),
         revenue=MonthlyRevenue("2026/10", 3000.0, 5.0, 28.0, 31.0),
         margin=MarginInfo(10000.0, 500.0, 400.0, -20.0, 4.0),
+        roe_pct=41.86,
+        ev_ebitda=14.90,
+        market_cap=53.6e12,
     )
     f_tw = flex.fundamental_card(tw_fund)
+    tw_json = json.dumps(f_tw.to_dict(), ensure_ascii=False)
     assert "基本面與資券摘要" in f_tw.alt_text
+    assert "41.86%" in tw_json
+    assert "14.90x" in tw_json
+    assert "53.60兆" in tw_json
+
+    # Financial sector card displays '金融不適用' for EV/EBITDA
+    fin_fund = FundamentalReport(
+        quote=StockQuote("2881", "2881.TW", "富邦金", True, "TWD", "stock"),
+        valuation=Valuation(pe=12.0, pb=1.5, yield_pct=4.2),
+        roe_pct=26.06,
+        ev_ebitda=None,
+        is_financial=True,
+        market_cap=1.5e12,
+    )
+    f_fin = flex.fundamental_card(fin_fund)
+    assert "金融不適用" in json.dumps(f_fin.to_dict(), ensure_ascii=False)
 
     us_fund = FundamentalReport(
         quote=_us_quote(),
         valuation=Valuation(pe=30.0, pb=40.0, yield_pct=0.5),
+        roe_pct=142.26,
+        ev_ebitda=None,
         market_cap=3e12,
         forward_pe=28.0,
         rev_growth_pct=8.0,
@@ -168,6 +198,7 @@ def test_fundamental_fx_overview_and_help_cards():
     )
     f_us = flex.fundamental_card(us_fund)
     assert "Apple" in f_us.alt_text
+    assert "142.26%" in f_us.to_json()
 
     fx_snaps = [
         QuickSnapshot(
