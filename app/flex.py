@@ -134,23 +134,53 @@ def _fmt_ev_ebitda(report: FundamentalReport) -> tuple[str, str]:
     return f"{report.ev_ebitda:.2f}x", _TEXT
 
 
-def _metric_cell(label: str, value: str, value_color: str = _TEXT) -> dict:
+def _fmt_holders(count: int) -> str:
+    if abs(count) >= 10_000:
+        return f"{count / 10_000:.1f}萬"
+    return f"{count:,}"
+
+
+def _fmt_holders_chg(delta: int) -> str:
+    sign = "+" if delta > 0 else ""
+    if abs(delta) >= 10_000:
+        return f"{sign}{delta / 10_000:.1f}萬"
+    return f"{sign}{delta:,}"
+
+
+def _metric_cell(
+    label: str,
+    value: str,
+    value_color: str = _TEXT,
+    sub: str | None = None,
+    sub_color: str = _MUTED,
+) -> dict:
+    contents = [
+        {"type": "text", "text": label, "size": "xxs", "color": _MUTED},
+        {
+            "type": "text",
+            "text": value,
+            "size": "sm",
+            "weight": "bold",
+            "color": value_color,
+            "adjustMode": "shrink-to-fit",
+        },
+    ]
+    if sub is not None:
+        contents.append(
+            {
+                "type": "text",
+                "text": sub,
+                "size": "xxs",
+                "color": sub_color,
+                "adjustMode": "shrink-to-fit",
+            }
+        )
     return {
         "type": "box",
         "layout": "vertical",
         "flex": 1,
         "spacing": "xs",
-        "contents": [
-            {"type": "text", "text": label, "size": "xxs", "color": _MUTED},
-            {
-                "type": "text",
-                "text": value,
-                "size": "sm",
-                "weight": "bold",
-                "color": value_color,
-                "adjustMode": "shrink-to-fit",
-            },
-        ],
+        "contents": contents,
     }
 
 
@@ -560,8 +590,31 @@ def institutional_card(report: InstReport, chart_url: str) -> FlexMessage:
                 _metric_cell("近5日合計", _fmt_inst(sum5, scale, unit), _inst_color(sum5, scale, unit)),
             ],
         },
-        {"type": "text", "text": f"交易日 {latest.day:%Y/%m/%d} · 點擊圖表看原圖", "size": "xxs", "color": _MUTED},
     ]
+
+    td = getattr(report, "tdcc", None)
+    if td is not None:
+        sub_1000 = _fmt_pct(td.whale_1000_chg) if td.whale_1000_chg is not None else None
+        sub_400 = _fmt_pct(td.whale_400_chg) if td.whale_400_chg is not None else None
+        sub_h = _fmt_holders_chg(td.shareholders_chg) if td.shareholders_chg is not None else None
+        body.extend(
+            [
+                {"type": "separator", "color": _BORDER},
+                {"type": "text", "text": f"集保股權（{td.date_str}）", "size": "xs", "weight": "bold", "color": _ACCENT},
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        _metric_cell("千張大戶", f"{td.whale_1000_pct:.2f}%", _TEXT, sub=sub_1000, sub_color=_pct_color(td.whale_1000_chg, True)),
+                        _metric_cell("400張以上", f"{td.whale_400_pct:.2f}%", _TEXT, sub=sub_400, sub_color=_pct_color(td.whale_400_chg, True)),
+                        _metric_cell("總股東人數", _fmt_holders(td.shareholders), _TEXT, sub=sub_h, sub_color=_pct_color(td.shareholders_chg, True)),
+                    ],
+                },
+            ]
+        )
+
+    body.append({"type": "text", "text": f"交易日 {latest.day:%Y/%m/%d} · 點擊圖表看原圖", "size": "xxs", "color": _MUTED})
     asset_type = "index" if report.market == "MARKET" else "stock"
     footer = _footer_nav(report.ticker, "T", True, asset_type)
     alt = f"{report.name} ({report.ticker}) {badge} {latest.day:%Y/%m/%d} 合計 {_fmt_inst(latest.total, scale, unit)} {unit}"

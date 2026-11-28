@@ -10,6 +10,7 @@ from app import flex
 from app.stock.data import AnnualDividend, DividendReport, QuickSnapshot, StockQuote
 from app.stock.fundamentals import FundamentalReport, MarginInfo, MonthlyRevenue, Valuation
 from app.stock.institutional import InstDay, InstReport
+from app.stock.tdcc import TdccSummary
 
 
 def _tw_quote() -> StockQuote:
@@ -82,6 +83,11 @@ def test_formatting_helpers():
     assert flex._roe_color(8.5) == flex._TEXT
     assert flex._roe_color(-3.0) == "#f6465d"
 
+    assert flex._fmt_holders(3381152) == "338.1萬"
+    assert flex._fmt_holders(3420) == "3,420"
+    assert flex._fmt_holders_chg(12500) == "+1.2萬"
+    assert flex._fmt_holders_chg(-350) == "-350"
+
 
 def test_footer_nav_variants():
     tw_nav = flex._footer_nav("2330", "K", True, "stock", kline_tf="D")
@@ -150,9 +156,23 @@ def test_dividend_and_institutional_cards():
         days=[InstDay(date(2026, 11, 20), 5000.0, 1000.0, -500.0, 5500.0)],
         foreign_holding_pct=73.5,
         market="TWSE",
+        tdcc=TdccSummary(
+            date_str="2026/11/27",
+            whale_1000_pct=84.09,
+            whale_400_pct=86.85,
+            shareholders=3381152,
+            whale_1000_chg=0.59,
+            whale_400_chg=0.85,
+            shareholders_chg=-18848,
+        ),
     )
     t_msg = flex.institutional_card(inst_rep, "https://example.test/t.png")
+    t_json = json.dumps(t_msg.to_dict(), ensure_ascii=False)
     assert "上市三大法人" in t_msg.alt_text
+    assert "集保股權（2026/11/27）" in t_json
+    assert "84.09%" in t_json
+    assert "86.85%" in t_json
+    assert "338.1萬" in t_json
 
 
 def test_fundamental_fx_overview_and_help_cards():

@@ -14,6 +14,8 @@ from datetime import date, timedelta
 
 import requests
 
+from app.stock import tdcc
+
 log = logging.getLogger(__name__)
 
 _TWSE = "https://www.twse.com.tw/rwd/zh/fund"
@@ -50,6 +52,7 @@ class InstReport:
     unit: str = "張"       # "張" for stocks, "億元" for market
     scale: float = 1000.0  # 1000 shares/lot for stocks, 1e8 NTD/億元 for market
     market: str = "TWSE"   # "TWSE", "TPEX", or "MARKET"
+    tdcc: tdcc.TdccSummary | None = None
 
 
 def _get_json(url: str) -> dict | None:
@@ -247,6 +250,7 @@ def fetch(ticker: str, num_days: int = 10, market: str | None = None) -> InstRep
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         holding_future = pool.submit(_foreign_holding, ticker)
+        tdcc_future = pool.submit(tdcc.lookup, ticker)
         tables = list(pool.map(_t86_table, weekdays))
 
     report = InstReport(ticker=ticker, name=ticker, market="TWSE")
@@ -263,14 +267,21 @@ def fetch(ticker: str, num_days: int = 10, market: str | None = None) -> InstRep
         holding = holding_future.result()
         if holding:
             report.foreign_holding_pct, report.foreign_holding_date = holding
+        report.tdcc = tdcc_future.result()
         return report
 
     # Fallback to TPEx OTC if not found on TWSE
-    return _fetch_tpex(ticker, weekdays, num_days)
+    return _fetch_tpex(ticker, weekdays, num_days, tdcc_summary=tdcc_future.result())
 
 
-def _fetch_tpex(ticker: str, weekdays: list[date], num_days: int) -> InstReport:
+def _fetch_tpex(
+    ticker: str,
+    weekdays: list[date],
+    num_days: int,
+    tdcc_summary: tdcc.TdccSummary | None = None,
+) -> InstReport:
     with ThreadPoolExecutor(max_workers=6) as pool:
+        tdcc_future = pool.submit(tdcc.lookup, ticker) if tdcc_summary is None else None
         tables = list(pool.map(_tpex_table, weekdays))
 
     report = InstReport(ticker=ticker, name=ticker, market="TPEX")
@@ -286,4 +297,5 @@ def _fetch_tpex(ticker: str, weekdays: list[date], num_days: int) -> InstReport:
 
     report.days.sort(key=lambda x: x.day)
     report.days = report.days[-num_days:]
+    report.tdcc = tdcc_summary if tdcc_future is None else tdcc_future.result()
     return report
