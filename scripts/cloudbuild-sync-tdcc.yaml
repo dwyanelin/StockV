@@ -1,0 +1,22 @@
+steps:
+  - name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install --no-cache-dir -q requests && \
+        python scripts/sync_tdcc.py \
+          --output tdcc_latest.json \
+          --existing-url https://storage.googleapis.com/stockv-linebot-data/tdcc_latest.json
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    args:
+      - gcloud
+      - storage
+      - cp
+      - tdcc_latest.json
+      - gs://stockv-linebot-data/tdcc_latest.json
+      - --cache-control=public, max-age=3600
+      - --content-type=application/json
+serviceAccount: projects/stockv-linebot/serviceAccounts/github-deployer@stockv-linebot.iam.gserviceaccount.com
+options:
+  logging: CLOUD_LOGGING_ONLY

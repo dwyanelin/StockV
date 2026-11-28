@@ -8,7 +8,7 @@ on:
 
 jobs:
   sync:
-    name: Build & Upload TDCC Snapshot to GCS
+    name: Build & Upload TDCC Snapshot (asia-east1)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -17,20 +17,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install requests
-        run: pip install --no-cache-dir requests
-
-      - name: Build compact TDCC JSON snapshot
-        run: |
-          python scripts/sync_tdcc.py \
-            --output tdcc_latest.json \
-            --existing-url https://storage.googleapis.com/stockv-linebot-data/tdcc_latest.json
 
       - name: Authenticate to Google Cloud (Keyless WIF OIDC)
         uses: google-github-actions/auth@v3
@@ -41,8 +27,10 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v3
 
-      - name: Upload snapshot to Cloud Storage
+      - name: Run TDCC Sync in Taiwan (asia-east1)
         run: |
-          gcloud storage cp tdcc_latest.json gs://stockv-linebot-data/tdcc_latest.json \
-            --cache-control="public, max-age=3600" \
-            --content-type="application/json"
+          gcloud builds submit . \
+            --region=asia-east1 \
+            --project=stockv-linebot \
+            --config=scripts/cloudbuild-sync-tdcc.yaml \
+            --quiet
