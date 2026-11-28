@@ -10,10 +10,11 @@ from app.stock import institutional
 
 
 @pytest.fixture(autouse=True)
-def _clear_caches():
+def _clear_caches(monkeypatch):
     institutional._t86_cache.clear()
     institutional._tpex_cache.clear()
     institutional._bfi82u_cache.clear()
+    monkeypatch.setattr(institutional.tdcc, "lookup", lambda code: None)
     yield
     institutional._t86_cache.clear()
     institutional._tpex_cache.clear()

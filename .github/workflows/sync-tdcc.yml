@@ -1,0 +1,48 @@
+name: Sync TDCC Weekly Snapshot
+
+on:
+  schedule:
+    # Every Saturday at 00:30 UTC (08:30 Taiwan time, after Friday night TDCC release)
+    - cron: "30 0 * * 6"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Build & Upload TDCC Snapshot to GCS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: pip install --no-cache-dir requests
+
+      - name: Build compact TDCC JSON snapshot
+        run: |
+          python scripts/sync_tdcc.py \
+            --output tdcc_latest.json \
+            --existing-url https://storage.googleapis.com/stockv-linebot-data/tdcc_latest.json
+
+      - name: Authenticate to Google Cloud (Keyless WIF OIDC)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Upload snapshot to Cloud Storage
+        run: |
+          gcloud storage cp tdcc_latest.json gs://stockv-linebot-data/tdcc_latest.json \
+            --cache-control="public, max-age=3600" \
+            --content-type="application/json"
